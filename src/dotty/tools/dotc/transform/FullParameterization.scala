@@ -6,6 +6,7 @@ import Types._
 import Contexts._
 import Symbols._
 import Decorators._
+import TypeUtils._
 import StdNames.nme
 import NameOps._
 import ast._
@@ -51,6 +52,7 @@ import ast.Trees._
 trait FullParameterization {
 
   import tpd._
+  import FullParameterization._
 
   /** If references to original symbol `referenced` from within fully parameterized method
    *  `derived` should be rewired to some fully parameterized method, the rewiring target symbol,
@@ -84,15 +86,16 @@ trait FullParameterization {
    *    }
    *
    *  If a self type is present, $this has this self type as its type.
+   *  @param abstractOverClass  if true, include the type parameters of the class in the method's list of type parameters.
    */
-  def fullyParameterizedType(info: Type, clazz: ClassSymbol)(implicit ctx: Context): Type = {
+  def fullyParameterizedType(info: Type, clazz: ClassSymbol, abstractOverClass: Boolean = true)(implicit ctx: Context): Type = {
     val (mtparamCount, origResult) = info match {
       case info @ PolyType(mtnames) => (mtnames.length, info.resultType)
       case info: ExprType => (0, info.resultType)
       case _ => (0, info)
     }
-    val ctparams = clazz.typeParams
-    val ctnames = ctparams.map(_.name.unexpandedName())
+    val ctparams = if (abstractOverClass) clazz.typeParams else Nil
+    val ctnames = ctparams.map(_.name.unexpandedName)
 
     /** The method result type */
     def resultType(mapClassParams: Type => Type) = {
@@ -104,18 +107,19 @@ trait FullParameterization {
     /** Replace class type parameters by the added type parameters of the polytype `pt` */
     def mapClassParams(tp: Type, pt: PolyType): Type = {
       val classParamsRange = (mtparamCount until mtparamCount + ctparams.length).toList
-      tp.substDealias(clazz.typeParams, classParamsRange map (PolyParam(pt, _)))
+      tp.substDealias(ctparams, classParamsRange map (PolyParam(pt, _)))
     }
 
-    /** The bounds for the added type paraneters of the polytype `pt` */
+    /** The bounds for the added type parameters of the polytype `pt` */
     def mappedClassBounds(pt: PolyType): List[TypeBounds] =
       ctparams.map(tparam => mapClassParams(tparam.info, pt).bounds)
 
     info match {
       case info @ PolyType(mtnames) =>
         PolyType(mtnames ++ ctnames)(
-          pt => (info.paramBounds ++ mappedClassBounds(pt))
-            .mapConserve(_.subst(info, pt).bounds),
+          pt =>
+            (info.paramBounds.map(mapClassParams(_, pt).bounds) ++
+             mappedClassBounds(pt)).mapConserve(_.subst(info, pt).bounds),
           pt => resultType(mapClassParams(_, pt)).subst(info, pt))
       case _ =>
         if (ctparams.isEmpty) resultType(identity)
@@ -123,37 +127,26 @@ trait FullParameterization {
     }
   }
 
-  /** Assuming `info` is a result of a `fullyParameterizedType` call, the signature of the
-   *  original method type `X` such that `info = fullyParameterizedType(X, ...)`.
-   */
-  def memberSignature(info: Type)(implicit ctx: Context): Signature = info match {
-    case info: PolyType => memberSignature(info.resultType)
-    case info @ MethodType(nme.SELF :: Nil, _) =>
-      val normalizedResultType = info.resultType match {
-        case rtp: MethodType => rtp
-        case rtp => ExprType(rtp)
-      }
-      normalizedResultType.signature
-    case _ =>
-      Signature.NotAMethod
-  }
-
   /** The type parameters (skolems) of the method definition `originalDef`,
    *  followed by the class parameters of its enclosing class.
    */
-  private def allInstanceTypeParams(originalDef: DefDef)(implicit ctx: Context): List[Symbol] =
-    originalDef.tparams.map(_.symbol) ::: originalDef.symbol.enclosingClass.typeParams
+  private def allInstanceTypeParams(originalDef: DefDef, abstractOverClass: Boolean)(implicit ctx: Context): List[Symbol] =
+    if (abstractOverClass)
+      originalDef.tparams.map(_.symbol) ::: originalDef.symbol.enclosingClass.typeParams
+    else originalDef.tparams.map(_.symbol)
 
   /** Given an instance method definition `originalDef`, return a
    *  fully parameterized method definition derived from `originalDef`, which
    *  has `derived` as symbol and `fullyParameterizedType(originalDef.symbol.info)`
    *  as info.
+   *  `abstractOverClass` defines weather the DefDef should abstract over type parameters
+   *  of class that contained original defDef
    */
-  def fullyParameterizedDef(derived: TermSymbol, originalDef: DefDef)(implicit ctx: Context): Tree =
+  def fullyParameterizedDef(derived: TermSymbol, originalDef: DefDef, abstractOverClass: Boolean = true)(implicit ctx: Context): Tree =
     polyDefDef(derived, trefs => vrefss => {
       val origMeth = originalDef.symbol
       val origClass = origMeth.enclosingClass.asClass
-      val origTParams = allInstanceTypeParams(originalDef)
+      val origTParams = allInstanceTypeParams(originalDef, abstractOverClass)
       val origVParams = originalDef.vparamss.flatten map (_.symbol)
       val thisRef :: argRefs = vrefss.flatten
 
@@ -172,6 +165,12 @@ trait FullParameterization {
           } else EmptyTree
         }
         tree match {
+          case Return(expr, from) if !from.isEmpty =>
+            val rewired = rewiredTarget(from, derived)
+            if (rewired.exists)
+              tpd.cpy.Return(tree)(expr, Ident(rewired.termRef))
+            else
+              EmptyTree
           case Ident(_) => rewireCall(thisRef)
           case Select(qual, _) => rewireCall(qual)
           case tree @ TypeApply(fn, targs1) =>
@@ -214,14 +213,31 @@ trait FullParameterization {
     })
 
   /** A forwarder expression which calls `derived`, passing along
-   *  - the type parameters and enclosing class parameters of `originalDef`,
+   *  - if `abstractOverClass` the type parameters and enclosing class parameters of originalDef`,
    *  - the `this` of the enclosing class,
    *  - the value parameters of the original method `originalDef`.
    */
-  def forwarder(derived: TermSymbol, originalDef: DefDef)(implicit ctx: Context): Tree =
+  def forwarder(derived: TermSymbol, originalDef: DefDef, abstractOverClass: Boolean = true)(implicit ctx: Context): Tree =
     ref(derived.termRef)
-      .appliedToTypes(allInstanceTypeParams(originalDef).map(_.typeRef))
+      .appliedToTypes(allInstanceTypeParams(originalDef, abstractOverClass).map(_.typeRef))
       .appliedTo(This(originalDef.symbol.enclosingClass.asClass))
       .appliedToArgss(originalDef.vparamss.nestedMap(vparam => ref(vparam.symbol)))
       .withPos(originalDef.rhs.pos)
+}
+
+object FullParameterization {
+
+  /** Assuming `info` is a result of a `fullyParameterizedType` call, the signature of the
+   *  original method type `X` such that `info = fullyParameterizedType(X, ...)`.
+   */
+  def memberSignature(info: Type)(implicit ctx: Context): Signature = info match {
+    case info: PolyType =>
+      memberSignature(info.resultType)
+    case info @ MethodType(nme.SELF :: Nil, _) =>
+      info.resultType.ensureMethodic.signature
+    case info @ MethodType(nme.SELF :: otherNames, thisType :: otherTypes) =>
+      info.derivedMethodType(otherNames, otherTypes, info.resultType).signature
+    case _ =>
+      Signature.NotAMethod
+  }
 }

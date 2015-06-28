@@ -71,6 +71,29 @@ object RefChecks {
     }
   }
 
+  /** Check that self type of this class conforms to self types of parents */
+  private def checkSelfType(clazz: Symbol)(implicit ctx: Context): Unit = clazz.info match {
+    case cinfo: ClassInfo =>
+      for (parent <- cinfo.classParents) {
+        val pself = parent.givenSelfType.asSeenFrom(clazz.thisType, parent.classSymbol)
+        if (pself.exists && !(cinfo.selfType <:< pself))
+          ctx.error(d"illegal inheritance: self type ${cinfo.selfType} of $clazz does not conform to self type $pself of parent ${parent.classSymbol}", clazz.pos)
+      }
+    case _ =>
+  }
+
+  /** Check that a class and its companion object to not both define
+   *  a class or module with same name
+   */
+  private def checkCompanionNameClashes(cls: Symbol)(implicit ctx: Context): Unit =
+    if (!(cls.owner is ModuleClass)) {
+      val other = cls.owner.linkedClass.info.decl(cls.name)
+      if (other.symbol.isClass)
+        ctx.error(s"name clash: ${cls.owner} defines $cls" + "\n" +
+          s"and its companion ${cls.owner.companionModule} also defines $other",
+          cls.pos)
+    }
+
   // Override checking ------------------------------------------------------------
 
   /** 1. Check all members of class `clazz` for overriding conditions.
@@ -184,12 +207,6 @@ object RefChecks {
           emitOverrideError(overrideErrorMsg(msg))
       }
 
-      def overrideTypeError() = {
-        if (noErrorType) {
-          emitOverrideError(overrideErrorMsg("has incompatible type"))
-        }
-      }
-
       def overrideAccessError() = {
         ctx.log(i"member: ${member.showLocated} ${member.flags}") // DEBUG
         ctx.log(i"other: ${other.showLocated} ${other.flags}") // DEBUG
@@ -280,9 +297,9 @@ object RefChecks {
           "(this rule is designed to prevent ``accidental overrides'')")
       } else if (other.isStable && !member.isStable) { // (1.4)
         overrideError("needs to be a stable, immutable value")
-      } else if (member.is(Lazy) && !other.isSourceMethod && !other.is(Deferred | Lazy)) {
+      } else if (member.is(Lazy) && !other.isRealMethod && !other.is(Deferred | Lazy)) {
         overrideError("cannot override a concrete non-lazy value")
-      } else if (other.is(Lazy, butNot = Deferred) && !other.isSourceMethod && !member.is(Lazy)) {
+      } else if (other.is(Lazy, butNot = Deferred) && !other.isRealMethod && !member.is(Lazy)) {
         overrideError("must be declared lazy to override a concrete lazy value")
       } else if (other.is(Deferred) && member.is(Macro) && member.extendedOverriddenSymbols.forall(_.is(Deferred))) { // (1.9)
         overrideError("cannot be used here - term macros cannot override abstract methods")
@@ -345,6 +362,7 @@ object RefChecks {
 
       def ignoreDeferred(member: SingleDenotation) =
         member.isType ||
+          member.symbol.is(SuperAccessor) || // not yet synthesized
           member.symbol.is(JavaDefined) && hasJavaErasedOverriding(member.symbol)
 
       // 2. Check that only abstract classes have deferred members
@@ -401,7 +419,8 @@ object RefChecks {
 
         for (member <- missing) {
           val memberSym = member.symbol
-          def undefined(msg: String) = abstractClassError(false, member.showDcl + " is not defined" + msg)
+          def undefined(msg: String) =
+            abstractClassError(false, s"${member.showDcl} is not defined $msg")
           val underlying = memberSym.underlyingSymbol
 
           // Give a specific error message for abstract vars based on why it fails:
@@ -437,9 +456,8 @@ object RefChecks {
                   case (pa, pc) :: Nil =>
                     val abstractSym = pa.typeSymbol
                     val concreteSym = pc.typeSymbol
-                    def subclassMsg(c1: Symbol, c2: Symbol) = (
-                      ": %s is a subclass of %s, but method parameter types must match exactly.".format(
-                        c1.showLocated, c2.showLocated))
+                    def subclassMsg(c1: Symbol, c2: Symbol) =
+                      s": ${c1.showLocated} is a subclass of ${c2.showLocated}, but method parameter types must match exactly."
                     val addendum =
                       if (abstractSym == concreteSym) {
                         val paArgs = pa.argInfos
@@ -459,12 +477,14 @@ object RefChecks {
                         subclassMsg(concreteSym, abstractSym)
                       else ""
 
-                    undefined("\n(Note that %s does not match %s%s)".format(pa, pc, addendum))
+                    undefined(s"\n(Note that $pa does not match $pc$addendum)")
                   case xs =>
-                    undefined("")
+                    undefined(s"\n(The class implements a member with a different type: ${concrete.showDcl})")
                 }
-              case _ =>
+              case Nil =>
                 undefined("")
+              case concretes =>
+                undefined(s"\n(The class implements members with different types: ${concretes.map(_.showDcl)}%\n  %)")
             }
           } else undefined("")
         }
@@ -684,6 +704,7 @@ import RefChecks._
  *  - any value classes conform to rules laid down by `checkAnyValSubClass`.
  *  - this(...) constructor calls do not forward reference other definitions in their block (not even lazy vals).
  *  - no forward reference in a local block jumps over a non-lazy val definition.
+ *  - a class and its companion object do not both define a class or module with the same name.
  *
  *  2. It warns about references to symbols labeled deprecated or migration.
 
@@ -707,41 +728,13 @@ import RefChecks._
  *  todo: But RefChecks is not done yet. It's still a somewhat dirty port from the Scala 2 version.
  *  todo: move untrivial logic to their own mini-phases
  */
-class RefChecks extends MiniPhase with SymTransformer { thisTransformer =>
+class RefChecks extends MiniPhase { thisTransformer =>
 
   import tpd._
 
   override def phaseName: String = "refchecks"
 
   val treeTransform = new Transform(NoLevelInfo)
-
-  /** Ensure the following members are not private:
-   *   - term members of traits
-   *   - the primary constructor of a value class
-   *   - the parameter accessor of a value class
-   */
-  override def transformSym(d: SymDenotation)(implicit ctx: Context) = {
-    def mustBePublicInValueClass = d.isPrimaryConstructor || d.is(ParamAccessor)
-    def mustBePublicInTrait = !d.is(Method) || d.isSetter || d.is(ParamAccessor)
-    def mustBePublic = {
-      val cls = d.owner
-      (isDerivedValueClass(cls) && mustBePublicInValueClass ||
-      cls.is(Trait) && mustBePublicInTrait)
-    }
-    if ((d is PrivateTerm) && mustBePublic) notPrivate(d) else d
-  }
-
-  /** Make private terms accessed from different classes non-private.
-   *  Note: this happens also for accesses between class and linked module class.
-   *  If we change the scheme at one point to make static module class computations
-   *  static members of the companion class, we should tighten the condition below.
-   */
-  private def ensurePrivateAccessible(d: SymDenotation)(implicit ctx: Context) =
-    if (d.is(PrivateTerm) && d.owner != ctx.owner.enclosingClass)
-      notPrivate(d).installAfter(thisTransformer)
-
-  private def notPrivate(d: SymDenotation)(implicit ctx: Context) =
-    d.copySymDenotation(initFlags = d.flags | NotJavaPrivate)
 
   class Transform(currentLevel: RefChecks.OptLevelInfo = RefChecks.NoLevelInfo) extends TreeTransform {
     def phase = thisTransformer
@@ -775,6 +768,8 @@ class RefChecks extends MiniPhase with SymTransformer { thisTransformer =>
     override def transformTemplate(tree: Template)(implicit ctx: Context, info: TransformerInfo) = {
       val cls = ctx.owner
       checkOverloadedRestrictions(cls)
+      checkSelfType(cls)
+      checkCompanionNameClashes(cls)
       checkAllOverrides(cls)
       checkAnyValSubclass(cls)
       tree
@@ -791,14 +786,12 @@ class RefChecks extends MiniPhase with SymTransformer { thisTransformer =>
 
     override def transformIdent(tree: Ident)(implicit ctx: Context, info: TransformerInfo) = {
       checkUndesiredProperties(tree.symbol, tree.pos)
-      ensurePrivateAccessible(tree.symbol)
       currentLevel.enterReference(tree.symbol, tree.pos)
       tree
     }
 
     override def transformSelect(tree: Select)(implicit ctx: Context, info: TransformerInfo) = {
       checkUndesiredProperties(tree.symbol, tree.pos)
-      ensurePrivateAccessible(tree.symbol)
       tree
     }
 
@@ -880,7 +873,7 @@ class RefChecks extends MiniPhase with SymTransformer { thisTransformer =>
       def onSyms[T](f: List[Symbol] => T) = f(List(receiver, actual))
 
       // @MAT normalize for consistency in error message, otherwise only part is normalized due to use of `typeSymbol`
-      def typesString = normalizeAll(qual.tpe.widen)+" and "+normalizeAll(other.tpe.widen)
+      def typesString = normalizeAll(qual.tpe.widen)+" and " + normalizeAll(other.tpe.widen)
 
       /* Symbols which limit the warnings we can issue since they may be value types */
       val isMaybeValue = Set[Symbol](AnyClass, AnyRefClass, AnyValClass, ObjectClass, ComparableClass, JavaSerializableClass)
@@ -1062,7 +1055,7 @@ class RefChecks extends MiniPhase with SymTransformer { thisTransformer =>
                                                       // FIXME: reconcile this check with one in resetAttrs
           case _ => checkUndesiredProperties(sym, tree.pos)
         }
-        if(sym.isJavaDefined)
+        if (sym.isJavaDefined)
           sym.typeParams foreach (_.cookJavaRawInfo())
         if (!tp.isHigherKinded && !skipBounds)
           checkBounds(tree, pre, sym.owner, sym.typeParams, args)
@@ -1106,7 +1099,7 @@ class RefChecks extends MiniPhase with SymTransformer { thisTransformer =>
           }
 
         case tpt@TypeTree() =>
-          if(tpt.original != null) {
+          if (tpt.original != null) {
             tpt.original foreach {
               case dc@TypeTreeWithDeferredRefCheck() =>
                 applyRefchecksToAnnotations(dc.check()) // #2416
@@ -1140,7 +1133,7 @@ class RefChecks extends MiniPhase with SymTransformer { thisTransformer =>
       }
 
       val doTransform =
-        sym.isSourceMethod &&
+        sym.isRealMethod &&
         sym.isCase &&
         sym.name == nme.apply &&
         isClassTypeAccessible(tree)
@@ -1389,7 +1382,7 @@ class RefChecks extends MiniPhase with SymTransformer { thisTransformer =>
             tree
 
           case treeInfo.WildcardStarArg(_) if !isRepeatedParamArg(tree) =>
-            unit.error(tree.pos, "no `: _*' annotation allowed here\n"+
+            unit.error(tree.pos, "no `: _*' annotation allowed here\n" +
               "(such annotations are only allowed in arguments to *-parameters)")
             tree
 

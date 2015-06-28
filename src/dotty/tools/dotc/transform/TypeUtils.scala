@@ -26,4 +26,9 @@ class TypeUtils(val self: Type) extends AnyVal {
 
   def isPrimitiveValueType(implicit ctx: Context): Boolean =
     self.classSymbol.isPrimitiveValueClass
+
+  def ensureMethodic(implicit ctx: Context): Type = self match {
+    case self: MethodicType => self
+    case _ => if (ctx.erasedTypes) MethodType(Nil, self) else ExprType(self)
+  }
 }

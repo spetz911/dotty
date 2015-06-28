@@ -36,7 +36,7 @@ object desugar {
     /** Make sure that for all enclosing module classes their companion lasses
      *  are completed. Reason: We need the constructor of such companion classes to
      *  be completed so that OriginalSymbol attachments are pushed to DerivedTypeTrees
-     *  in appy/unapply methods.
+     *  in apply/unapply methods.
      */
     override def ensureCompletions(implicit ctx: Context) =
       if (!(ctx.owner is Package))
@@ -59,7 +59,6 @@ object desugar {
           case tp: NamedType if tp.symbol.owner eq originalOwner =>
             val defctx = ctx.outersIterator.dropWhile(_.scope eq ctx.scope).next
             var local = defctx.denotNamed(tp.name).suchThat(_ is ParamOrAccessor).symbol
-            typr.println(s"rewiring ${tp.symbol} from ${originalOwner.showLocated} to ${local.showLocated}, current owner = ${ctx.owner.showLocated}")
             if (local.exists) (defctx.owner.thisType select local).dealias
             else throw new Error(s"no matching symbol for ${sym.showLocated} in ${defctx.owner} / ${defctx.effectiveScope}")
           case _ =>
@@ -219,7 +218,7 @@ object desugar {
 
   /** The expansion of a class definition. See inline comments for what is involved */
   def classDef(cdef: TypeDef)(implicit ctx: Context): Tree = {
-    val TypeDef(name, impl @ Template(constr0, parents, self, body)) = cdef
+    val TypeDef(name, impl @ Template(constr0, parents, self, _)) = cdef
     val mods = cdef.mods
 
     val (constr1, defaultGetters) = defDef(constr0, isPrimaryConstructor = true) match {
@@ -243,7 +242,7 @@ object desugar {
     val constr = cpy.DefDef(constr1)(tparams = constrTparams, vparamss = constrVparamss)
 
     // Add constructor type parameters to auxiliary constructors
-    val normalizedBody = body map {
+    val normalizedBody = impl.body map {
       case ddef: DefDef if ddef.name.isConstructorName =>
         cpy.DefDef(ddef)(tparams = constrTparams)
       case stat =>
@@ -290,8 +289,17 @@ object desugar {
         val caseParams = constrVparamss.head.toArray
         val productElemMeths = for (i <- 0 until arity) yield
           syntheticProperty(nme.selectorName(i), Select(This(EmptyTypeName), caseParams(i).name))
+        def isRepeated(tree: Tree): Boolean = tree match {
+          case PostfixOp(_, nme.raw.STAR) => true
+          case ByNameTypeTree(tree1) => isRepeated(tree1)
+          case _ => false
+        }
+        val hasRepeatedParam = constrVparamss.exists(_.exists {
+          case ValDef(_, tpt, _) => isRepeated(tpt)
+          case _ => false
+        })
         val copyMeths =
-          if (mods is Abstract) Nil
+          if (mods.is(Abstract) || hasRepeatedParam) Nil  // cannot have default arguments for repeated parameters, hence copy method is not issued
           else {
             def copyDefault(vparam: ValDef) =
               makeAnnotated(defn.UncheckedVarianceAnnot, refOfDef(vparam))
@@ -327,7 +335,7 @@ object desugar {
             .withMods(synthetic))
       .withPos(cdef.pos).toList
 
-    // The companion object defifinitions, if a companion is needed, Nil otherwise.
+    // The companion object definitions, if a companion is needed, Nil otherwise.
     // companion definitions include:
     // 1. If class is a case class case class C[Ts](p1: T1, ..., pN: TN)(moreParams):
     //     def apply[Ts](p1: T1, ..., pN: TN)(moreParams) = new C[Ts](p1, ..., pN)(moreParams)  (unless C is abstract)
@@ -339,7 +347,10 @@ object desugar {
     val companions =
       if (mods is Case) {
         val parent =
-          if (constrTparams.nonEmpty || constrVparamss.length > 1) anyRef
+          if (constrTparams.nonEmpty ||
+              constrVparamss.length > 1 ||
+              mods.is(Abstract) ||
+              constr.mods.is(Private)) anyRef
             // todo: also use anyRef if constructor has a dependent method type (or rule that out)!
           else (constrVparamss :\ classTypeRef) ((vparams, restpe) => Function(vparams map (_.tpt), restpe))
         val applyMeths =
@@ -356,8 +367,9 @@ object desugar {
         companionDefs(parent, applyMeths ::: unapplyMeth :: defaultGetters)
       }
       else if (defaultGetters.nonEmpty)
-        companionDefs(anyRef, defaultGetters)
+          companionDefs(anyRef, defaultGetters)
       else Nil
+
 
     // For an implicit class C[Ts](p11: T11, ..., p1N: T1N) ... (pM1: TM1, .., pMN: TMN), the method
     //     synthetic implicit C[Ts](p11: T11, ..., p1N: T1N) ... (pM1: TM1, ..., pMN: TMN): C[Ts] =
@@ -403,6 +415,8 @@ object desugar {
     flatTree(cdef1 :: companions ::: implicitWrappers)
   }
 
+  val AccessOrSynthetic = AccessFlags | Synthetic
+
   /** Expand
    *
    *    object name extends parents { self => body }
@@ -422,15 +436,15 @@ object desugar {
       val modul = ValDef(name, clsRef, New(clsRef, Nil))
         .withMods(mods | ModuleCreationFlags)
         .withPos(mdef.pos)
-      val ValDef(selfName, selfTpt, selfRhs) = tmpl.self
+      val ValDef(selfName, selfTpt, _) = tmpl.self
       val selfMods = tmpl.self.mods
       if (!selfTpt.isEmpty) ctx.error("object definition may not have a self type", tmpl.self.pos)
-      val clsSelf = ValDef(selfName, SingletonTypeTree(Ident(name)), selfRhs)
+      val clsSelf = ValDef(selfName, SingletonTypeTree(Ident(name)), tmpl.self.rhs)
         .withMods(selfMods)
         .withPos(tmpl.self.pos orElse tmpl.pos.startPos)
       val clsTmpl = cpy.Template(tmpl)(self = clsSelf, body = tmpl.body)
       val cls = TypeDef(clsName, clsTmpl)
-        .withMods(mods.toTypeFlags & AccessFlags | ModuleClassCreationFlags)
+        .withMods(mods.toTypeFlags & AccessOrSynthetic | ModuleClassCreationFlags)
       Thicket(modul, classDef(cls))
     }
   }
@@ -584,8 +598,8 @@ object desugar {
       }
     }
 
-    /** Create tree for for-comprehension <for (enums) do body> or
-     *   <for (enums) yield body> where mapName and flatMapName are chosen
+    /** Create tree for for-comprehension `<for (enums) do body>` or
+     *   `<for (enums) yield body>` where mapName and flatMapName are chosen
      *  corresponding to whether this is a for-do or a for-yield.
      *  The creation performs the following rewrite rules:
      *
@@ -624,7 +638,7 @@ object desugar {
      *        TupleN(x_1, ..., x_N)
      *      } ...)
      *
-     *    If any of the P_i are variable patterns, the corresponding `x_i @ P_i' is not generated
+     *    If any of the P_i are variable patterns, the corresponding `x_i @ P_i` is not generated
      *    and the variable constituting P_i is used instead of x_i
      *
      *  @param mapName      The name to be used for maps (either map or foreach)
@@ -777,7 +791,7 @@ object desugar {
             New(ref(defn.RepeatedAnnot.typeRef), Nil :: Nil),
             AppliedTypeTree(ref(seqClass.typeRef), t))
         } else {
-          assert(ctx.mode.isExpr, ctx.mode)
+          assert(ctx.mode.isExpr || ctx.reporter.hasErrors, ctx.mode)
           Select(t, op)
         }
       case PrefixOp(op, t) =>
@@ -858,21 +872,22 @@ object desugar {
    *      trait <refinement> extends C { this: T1 => type T <: A }
    *
    *  The result of this method is used for validity checking, is thrown away afterwards.
-   *  @param parentType   The type of `parent`
+   *  @param parent  The type of `parent`
    */
   def refinedTypeToClass(parent: tpd.Tree, refinements: List[Tree])(implicit ctx: Context): TypeDef = {
-    def stripToCore(tp: Type): Type = tp match {
-      case tp: RefinedType if tp.argInfos.nonEmpty => tp // parameterized class type
-      case tp: TypeRef if tp.symbol.isClass => tp        // monomorphic class type
+    def stripToCore(tp: Type): List[Type] = tp match {
+      case tp: RefinedType if tp.argInfos.nonEmpty => tp :: Nil // parameterized class type
+      case tp: TypeRef if tp.symbol.isClass => tp :: Nil     // monomorphic class type
       case tp: TypeProxy => stripToCore(tp.underlying)
-      case _ => defn.AnyType
+      case AndType(tp1, tp2) => stripToCore(tp1) ::: stripToCore(tp2)
+      case _ => defn.AnyType :: Nil
     }
-    val parentCore = stripToCore(parent.tpe)
+    val parentCores = stripToCore(parent.tpe)
     val untpdParent = TypedSplice(parent)
-    val (classParent, self) =
-      if (parent.tpe eq parentCore) (untpdParent, EmptyValDef)
-      else (TypeTree(parentCore), ValDef(nme.WILDCARD, untpdParent, EmptyTree))
-    val impl = Template(emptyConstructor, classParent :: Nil, self, refinements)
+    val (classParents, self) =
+      if (parentCores.length == 1 && (parent.tpe eq parentCores.head)) (untpdParent :: Nil, EmptyValDef)
+      else (parentCores map TypeTree, ValDef(nme.WILDCARD, untpdParent, EmptyTree))
+    val impl = Template(emptyConstructor, classParents, self, refinements)
     TypeDef(tpnme.REFINE_CLASS, impl).withFlags(Trait)
   }
 

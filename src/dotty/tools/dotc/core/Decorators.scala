@@ -7,6 +7,7 @@ import Contexts._, Names._, Phases._, printing.Texts._, printing.Printer, printi
 import util.Positions.Position, util.SourcePosition
 import collection.mutable.ListBuffer
 import dotty.tools.dotc.transform.TreeTransforms._
+import typer.Mode
 import scala.language.implicitConversions
 
 /** This object provides useful implicit decorators for types defined elsewhere */
@@ -35,7 +36,7 @@ object Decorators {
   final val MaxFilterRecursions = 1000
 
   /** Implements filterConserve, zipWithConserve methods
-   *  on lists that avoid dupliation of list nodes where feasible.
+   *  on lists that avoid duplication of list nodes where feasible.
    */
   implicit class ListDecorator[T](val xs: List[T]) extends AnyVal {
 
@@ -172,11 +173,11 @@ object Decorators {
       def treatSingleArg(arg: Any) : Any =
         try
           arg match {
-            case arg: Showable => arg.show
+            case arg: Showable => arg.show(ctx.addMode(Mode.FutureDefsOK))
             case _ => arg
           }
         catch {
-          case ex: Exception => s"(missing due to $ex)"
+          case ex: Exception => throw ex // s"(missing due to $ex)"
         }
 
       val prefix :: suffixes = sc.parts.toList

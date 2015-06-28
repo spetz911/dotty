@@ -46,7 +46,7 @@ object ProtoTypes {
      *  fits the given expected result type.
      */
     def constrainResult(mt: Type, pt: Type)(implicit ctx: Context): Boolean = pt match {
-      case _: FunProto =>
+      case pt: FunProto =>
         mt match {
           case mt: MethodType =>
             mt.isDependent || constrainResult(mt.resultType, pt.resultType)
@@ -78,7 +78,7 @@ object ProtoTypes {
     def fold[T](x: T, ta: TypeAccumulator[T])(implicit ctx: Context): T = x
   }
 
-  /** A class marking ignored prototypes that can be reviealed by `deepenProto` */
+  /** A class marking ignored prototypes that can be revealed by `deepenProto` */
   case class IgnoredProto(ignored: Type) extends UncachedGroundType with MatchAlways {
     override def deepenProto(implicit ctx: Context): Type = ignored
   }
@@ -162,9 +162,11 @@ object ProtoTypes {
    *
    *  [](args): resultType
    */
-  case class FunProto(args: List[untpd.Tree], override val resultType: Type, typer: Typer)(implicit ctx: Context)
+  case class FunProto(args: List[untpd.Tree], resType: Type, typer: Typer)(implicit ctx: Context)
   extends UncachedGroundType with ApplyingProto {
     private var myTypedArgs: List[Tree] = Nil
+
+    override def resultType(implicit ctx: Context) = resType
 
     /** A map in which typed arguments can be stored to be later integrated in `typedArgs`. */
     private var myTypedArg: SimpleMap[untpd.Tree, Tree] = SimpleMap.Empty
@@ -241,10 +243,13 @@ object ProtoTypes {
    *
    *    []: argType => resultType
    */
-  abstract case class ViewProto(argType: Type, override val resultType: Type)
+  abstract case class ViewProto(argType: Type, resType: Type)
   extends CachedGroundType with ApplyingProto {
+
+    override def resultType(implicit ctx: Context) = resType
+
     def isMatchedBy(tp: Type)(implicit ctx: Context): Boolean =
-  	  ctx.typer.isApplicable(tp, argType :: Nil, resultType)
+      ctx.typer.isApplicable(tp, argType :: Nil, resultType)
 
     def derivedViewProto(argType: Type, resultType: Type)(implicit ctx: Context) =
       if ((argType eq this.argType) && (resultType eq this.resultType)) this
@@ -274,7 +279,10 @@ object ProtoTypes {
    *
    *    [] [targs] resultType
    */
-  case class PolyProto(targs: List[Type], override val resultType: Type) extends UncachedGroundType with ProtoType {
+  case class PolyProto(targs: List[Type], resType: Type) extends UncachedGroundType with ProtoType {
+
+    override def resultType(implicit ctx: Context) = resType
+
     override def isMatchedBy(tp: Type)(implicit ctx: Context) = {
       def isInstantiatable(tp: Type) = tp.widen match {
         case PolyType(paramNames) => paramNames.length == targs.length
@@ -284,8 +292,8 @@ object ProtoTypes {
     }
 
     def derivedPolyProto(targs: List[Type], resultType: Type) =
-      if ((targs eq this.targs) && (resultType eq this.resultType)) this
-      else PolyProto(targs, resultType)
+      if ((targs eq this.targs) && (resType eq this.resType)) this
+      else PolyProto(targs, resType)
 
     def map(tm: TypeMap)(implicit ctx: Context): PolyProto =
       derivedPolyProto(targs mapConserve tm, tm(resultType))
@@ -318,13 +326,13 @@ object ProtoTypes {
 
     def newTypeVars(pt: PolyType): List[TypeVar] =
       for (n <- (0 until pt.paramNames.length).toList)
-      yield new TypeVar(PolyParam(pt, n), state, owningTree)
+      yield new TypeVar(PolyParam(pt, n), state, owningTree, ctx.owner)
 
     val added =
       if (state.constraint contains pt) pt.duplicate(pt.paramNames, pt.paramBounds, pt.resultType)
       else pt
     val tvars = if (owningTree.isEmpty) Nil else newTypeVars(added)
-    state.constraint = state.constraint.add(added, tvars)
+    ctx.typeComparer.addToConstraint(added, tvars)
     (added, tvars)
   }
 
@@ -376,7 +384,7 @@ object ProtoTypes {
     case tp: TypeAlias => // default case, inlined for speed
       tp.derivedTypeAlias(wildApprox(tp.alias, theMap))
     case tp @ PolyParam(poly, pnum) =>
-      ctx.typerState.constraint.at(tp) match {
+      ctx.typerState.constraint.entry(tp) match {
         case bounds: TypeBounds => wildApprox(WildcardType(bounds))
         case NoType => WildcardType(wildApprox(poly.paramBounds(pnum)).bounds)
         case inst => wildApprox(inst)

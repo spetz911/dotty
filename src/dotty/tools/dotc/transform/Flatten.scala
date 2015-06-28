@@ -6,7 +6,6 @@ import DenotTransformers.SymTransformer
 import Phases.Phase
 import Contexts.Context
 import Flags._
-import SymUtils._
 import SymDenotations.SymDenotation
 import collection.mutable
 import TreeTransforms.MiniPhaseTransform

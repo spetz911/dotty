@@ -13,7 +13,7 @@ import dotty.tools.io.{ ClassPath, AbstractFile }
 import Contexts._, Symbols._, Flags._, SymDenotations._, Types._, Scopes._, util.Positions._, Names._
 import StdNames._, NameOps._
 import Decorators.{StringDecorator, StringInterpolators}
-import pickling.ClassfileParser
+import classfile.ClassfileParser
 import scala.util.control.NonFatal
 
 object SymbolLoaders {
@@ -152,7 +152,7 @@ class SymbolLoaders {
 
     def doComplete(root: SymDenotation)(implicit ctx: Context): Unit = {
       assert(root is PackageClass, root)
- 	    def maybeModuleClass(classRep: ClassPath#ClassRep) = classRep.name.last == '$'
+        def maybeModuleClass(classRep: ClassPath#ClassRep) = classRep.name.last == '$'
       val pre = root.owner.thisType
       root.info = ClassInfo(pre, root.symbol.asClass, Nil, currentDecls, pre select sourceModule)
       if (!sourceModule.isCompleted)
@@ -182,7 +182,7 @@ abstract class SymbolLoader extends LazyType {
 
   def sourceFileOrNull: AbstractFile = null
 
-  /** Description of the resource (ClassPath, AbstractFile, MsilFile)
+  /** Description of the resource (ClassPath, AbstractFile)
    *  being processed by this loader
    */
   def description: String
@@ -217,7 +217,7 @@ abstract class SymbolLoader extends LazyType {
           denot.markAbsent()
       postProcess(root)
       if (!root.isRoot)
-        postProcess(root.linkedClass.denot)
+        postProcess(root.scalacLinkedClass.denot)
     }
   }
 }
@@ -226,10 +226,10 @@ class ClassfileLoader(val classfile: AbstractFile) extends SymbolLoader {
 
   override def sourceFileOrNull: AbstractFile = classfile
 
-  def description = "class file "+ classfile.toString
+  def description = "class file " + classfile.toString
 
   def rootDenots(rootDenot: ClassDenotation)(implicit ctx: Context): (ClassDenotation, ClassDenotation) = {
-    val linkedDenot = rootDenot.linkedClass.denot match {
+    val linkedDenot = rootDenot.scalacLinkedClass.denot match {
       case d: ClassDenotation => d
       case d =>
         // this can happen if the companion if shadowed by a val or type
@@ -251,14 +251,17 @@ class ClassfileLoader(val classfile: AbstractFile) extends SymbolLoader {
     else (rootDenot, linkedDenot)
   }
 
-  def doComplete(root: SymDenotation)(implicit ctx: Context): Unit = {
+  override def doComplete(root: SymDenotation)(implicit ctx: Context): Unit =
+    load(root)
+
+  def load(root: SymDenotation)(implicit ctx: Context): Option[ClassfileParser.Embedded] = {
     val (classRoot, moduleRoot) = rootDenots(root.asClass)
     new ClassfileParser(classfile, classRoot, moduleRoot)(ctx).run()
   }
 }
 
 class SourcefileLoader(val srcfile: AbstractFile) extends SymbolLoader {
-  def description = "source file "+ srcfile.toString
+  def description = "source file " + srcfile.toString
   override def sourceFileOrNull = srcfile
   def doComplete(root: SymDenotation)(implicit ctx: Context): Unit = unsupported("doComplete")
 }

@@ -83,8 +83,8 @@ object StdNames {
     final val HASHkw: N      = kw("#")
     final val ATkw: N        = kw("@")
 
-    val ANON_CLASS: N            = "$anon"
-    val ANON_FUN: N              = "$anonfun"
+    val ANON_CLASS: N                 = "$anon"
+    val ANON_FUN: N                   = "$anonfun"
     val BITMAP_PREFIX: N              = "bitmap$"
     val BITMAP_NORMAL: N              = BITMAP_PREFIX         // initialization bitmap for public/protected lazy vals
     val BITMAP_TRANSIENT: N           = BITMAP_PREFIX + "trans$"    // initialization bitmap for transient lazy vals
@@ -100,28 +100,33 @@ object StdNames {
     val EXPAND_SEPARATOR: N           = "$$"
     val IMPL_CLASS_SUFFIX: N          = "$class"
     val IMPORT: N                     = "<import>"
-    val INHERITED: N                  = "(inherited)"  // tag to be used until we have proper name kinds
     val INTERPRETER_IMPORT_WRAPPER: N = "$iw"
     val INTERPRETER_LINE_PREFIX: N    = "line"
     val INTERPRETER_VAR_PREFIX: N     = "res"
     val INTERPRETER_WRAPPER_SUFFIX: N = "$object"
     val LOCALDUMMY_PREFIX: N          = "<local "       // owner of local blocks
     val MODULE_SUFFIX: N              = NameTransformer.MODULE_SUFFIX_STRING
+    val AVOID_CLASH_SUFFIX: N         = "$_avoid_name_clash_$"
     val MODULE_VAR_SUFFIX: N          = "$module"
     val NAME_JOIN: N                  = NameTransformer.NAME_JOIN_STRING
     val USCORE_PARAM_PREFIX: N        = "_$"
+    val OPS_PACKAGE: N                = "<special-ops>"
     val OVERLOADED: N                 = "<overloaded>"
     val PACKAGE: N                    = "package"
     val PACKAGE_CLS: N                = "package$"
     val PROTECTED_PREFIX: N           = "protected$"
     val PROTECTED_SET_PREFIX: N       = PROTECTED_PREFIX + "set"
     val ROOT: N                       = "<root>"
+    val SHADOWED: N                   = "(shadowed)"  // tag to be used until we have proper name kinds
     val SINGLETON_SUFFIX: N           = ".type"
     val SPECIALIZED_SUFFIX: N         = "$sp"
     val SUPER_PREFIX: N               = "super$"
     val WHILE_PREFIX: N               = "while$"
     val DEFAULT_EXCEPTION_NAME: N     = "ex$"
     val INITIALIZER_PREFIX: N         = "initial$"
+    val COMPANION_MODULE_METHOD: N    = "companion$module"
+    val COMPANION_CLASS_METHOD: N     = "companion$class"
+    val TRAIT_SETTER_SEPARATOR: N     = "$_setter_$"
 
     // value types (and AnyRef) are all used as terms as well
     // as (at least) arguments to the @specialize annotation.
@@ -145,8 +150,10 @@ object StdNames {
     final val Seq: N        = "Seq"
     final val Symbol: N     = "Symbol"
     final val ClassTag: N   = "ClassTag"
+    final val classTag: N   = "classTag"
     final val WeakTypeTag: N = "WeakTypeTag"
     final val TypeTag : N   = "TypeTag"
+    final val typeTag: N    = "typeTag"
     final val Expr: N       = "Expr"
     final val String: N     = "String"
     final val Annotation: N = "Annotation"
@@ -166,7 +173,7 @@ object StdNames {
     final val WILDCARD_STAR: N                  = "_*"
     final val REIFY_TREECREATOR_PREFIX: N       = "$treecreator"
     final val REIFY_TYPECREATOR_PREFIX: N       = "$typecreator"
-    final val LAMBDA_ARG_PREFIX: N              = "$hkArg$"
+    final val LAMBDA_ARG_PREFIX: N              = "HK$"
     final val LAMBDA_ARG_PREFIXhead: Char       = LAMBDA_ARG_PREFIX.head
 
     final val Any: N             = "Any"
@@ -211,6 +218,7 @@ object StdNames {
     final val RuntimeParamAnnotationATTR: N = "RuntimeVisibleParameterAnnotations" // RetentionPolicy.RUNTIME (annotations on parameters)
     final val ScalaATTR: N                  = "Scala"
     final val ScalaSignatureATTR: N         = "ScalaSig"
+    final val TASTYATTR: N                  = "TASTY"
     final val SignatureATTR: N              = "Signature"
     final val SourceFileATTR: N             = "SourceFile"
     final val SyntheticATTR: N              = "Synthetic"
@@ -221,10 +229,12 @@ object StdNames {
     val ANYname: N                  = "<anyname>"
     val CONSTRUCTOR: N              = Names.CONSTRUCTOR.toString
     val DEFAULT_CASE: N             = "defaultCase$"
+    val EVT2U: N                    = "evt2u$"
     val EQEQ_LOCAL_VAR: N           = "eqEqTemp$"
     val FAKE_LOCAL_THIS: N          = "this$"
     val IMPLCLASS_CONSTRUCTOR: N    = "$init$"
     val LAZY_LOCAL: N               = "$lzy"
+    val LAZY_LOCAL_INIT: N          = "$lzyINIT"
     val LAZY_FIELD_OFFSET: N        = "OFFSET$"
     val LAZY_SLOW_SUFFIX: N         = "$lzycompute"
     val LOCAL_SUFFIX: N             = "$$local"
@@ -251,6 +261,7 @@ object StdNames {
     val SKOLEM: N                   = "<skolem>"
     val SPECIALIZED_INSTANCE: N     = "specInstance$"
     val THIS: N                     = "_$this"
+    val U2EVT: N                    = "u2evt$"
 
     final val Nil: N                = "Nil"
     final val Predef: N             = "Predef"
@@ -410,6 +421,7 @@ object StdNames {
     val isArray: N              = "isArray"
     val isDefined: N            = "isDefined"
     val isDefinedAt: N          = "isDefinedAt"
+    val isDefinedAtImpl: N      = "$isDefinedAt"
     val isEmpty: N              = "isEmpty"
     val isInstanceOf_ : N       = "isInstanceOf"
     val java: N                 = "java"
@@ -468,6 +480,7 @@ object StdNames {
     val selectTerm: N           = "selectTerm"
     val selectType: N           = "selectType"
     val self: N                 = "self"
+    val seqToArray: N           = "seqToArray"
     val setAccessible: N        = "setAccessible"
     val setAnnotations: N       = "setAnnotations"
     val setSymbol: N            = "setSymbol"
@@ -532,6 +545,22 @@ object StdNames {
       final val TILDE: N  = "~"
 
       final val isUnary: Set[Name] = Set(MINUS, PLUS, TILDE, BANG)
+    }
+
+    object specializedTypeNames {
+      final val Boolean: N = "Z"
+      final val Byte: N    = "B"
+      final val Char: N    = "C"
+      final val Short: N   = "S"
+      final val Int: N     = "I"
+      final val Long: N    = "J"
+      final val Float: N   = "F"
+      final val Double: N  = "D"
+      final val Void: N    = "V"
+      final val Object: N  = "L"
+
+      final val prefix: N = "$mc"
+      final val suffix: N = "$sp"
     }
 
     // value-conversion methods
@@ -703,7 +732,7 @@ object StdNames {
   class ScalaTypeNames extends ScalaNames[TypeName] {
     protected implicit def fromString(s: String): TypeName = typeName(s)
 
-    @switch def syntheticTypeParamName(i: Int): TypeName = "T"+i
+    @switch def syntheticTypeParamName(i: Int): TypeName = "T" + i
 
     def syntheticTypeParamNames(num: Int): List[TypeName] =
       (0 until num).map(syntheticTypeParamName)(breakOut)

@@ -11,6 +11,7 @@ import Names._
 import StdNames._
 import NameOps._
 import Flags._
+import Annotations._
 import language.implicitConversions
 
 object SymUtils {
@@ -24,30 +25,20 @@ object SymUtils {
 class SymUtils(val self: Symbol) extends AnyVal {
   import SymUtils._
 
-  def superClass(implicit ctx: Context) = {
-    val parents = self.asClass.classInfo.parents
-    if (parents.isEmpty) NoSymbol
-    else parents.head.symbol
-  }
-
-
-  /**
-   * For a class: All interfaces implemented by a class except for those inherited through the superclass.
-   * For a trait: all parent traits
-   */
-
-  def superInterfaces(implicit ctx: Context) = {
-    val superCls = self.superClass
+  /** All traits implemented by a class or trait except for those inherited through the superclass. */
+  def directlyInheritedTraits(implicit ctx: Context) = {
+    val superCls = self.asClass.superClass
     val baseClasses = self.asClass.baseClasses
     if (baseClasses.isEmpty) Nil
     else baseClasses.tail.takeWhile(_ ne superCls).reverse
-
   }
 
-  /** All interfaces implemented by a class, except for those inherited through the superclass. */
+  /** All traits implemented by a class, except for those inherited through the superclass.
+   *  The empty list if `self` is a trait.
+   */
   def mixins(implicit ctx: Context) = {
     if (self is Trait) Nil
-    else superInterfaces
+    else directlyInheritedTraits
   }
 
   def isTypeTestOrCast(implicit ctx: Context): Boolean =
@@ -79,6 +70,9 @@ class SymUtils(val self: Symbol) extends AnyVal {
   def accessorNamed(name: TermName)(implicit ctx: Context): Symbol =
     self.owner.info.decl(name).suchThat(_ is Accessor).symbol
 
+  def termParamAccessors(implicit ctx: Context): List[Symbol] =
+    self.info.decls.filter(_ is TermParamAccessor).toList
+
   def caseAccessors(implicit ctx:Context) =
     self.info.decls.filter(_ is CaseAccessor).toList
 
@@ -92,12 +86,17 @@ class SymUtils(val self: Symbol) extends AnyVal {
   def field(implicit ctx: Context): Symbol =
     self.owner.info.decl(self.asTerm.name.fieldName).suchThat(!_.is(Method)).symbol
 
-  /** `fullName` where `$' is the separator character */
-  def flatName(implicit ctx: Context): Name = self.fullNameSeparated('$')
-
-  def initializer(implicit ctx: Context): TermSymbol =
-    self.owner.info.decl(InitializerName(self.asTerm.name)).symbol.asTerm
-
   def isField(implicit ctx: Context): Boolean =
     self.isTerm && !self.is(Method)
+
+  def implClass(implicit ctx: Context): Symbol =
+    self.owner.info.decl(self.name.implClassName).symbol
+
+  def annotationsCarrying(meta: ClassSymbol)(implicit ctx: Context): List[Annotation] =
+    self.annotations.filter(_.symbol.hasAnnotation(meta))
+
+  def withAnnotationsCarrying(from: Symbol, meta: ClassSymbol)(implicit ctx: Context): self.type = {
+    self.addAnnotations(from.annotationsCarrying(meta))
+    self
+  }
 }

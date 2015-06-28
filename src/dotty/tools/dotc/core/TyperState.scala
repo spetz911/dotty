@@ -9,6 +9,7 @@ import util.{SimpleMap, DotClass}
 import reporting._
 import printing.{Showable, Printer}
 import printing.Texts._
+import config.Config
 import collection.mutable
 
 class TyperState(r: Reporter) extends DotClass with Showable {
@@ -17,8 +18,9 @@ class TyperState(r: Reporter) extends DotClass with Showable {
   def reporter = r
 
   /** The current constraint set */
-  def constraint: Constraint = new Constraint(SimpleMap.Empty, SimpleMap.Empty)
-  def constraint_=(c: Constraint): Unit = {}
+  def constraint: Constraint =
+    new OrderingConstraint(SimpleMap.Empty, SimpleMap.Empty, SimpleMap.Empty)
+  def constraint_=(c: Constraint)(implicit ctx: Context): Unit = {}
 
   /** The uninstantiated variables */
   def uninstVars = constraint.uninstVars
@@ -38,7 +40,7 @@ class TyperState(r: Reporter) extends DotClass with Showable {
    *  is done only in a temporary way for contexts that may be retracted
    *  without also retracting the type var as a whole.
    */
-  def instType(tvar: TypeVar): Type = constraint.at(tvar.origin) match {
+  def instType(tvar: TypeVar)(implicit ctx: Context): Type = constraint.entry(tvar.origin) match {
     case _: TypeBounds => NoType
     case tp: PolyParam =>
       var tvar1 = constraint.typeVarOfParam(tp)
@@ -84,7 +86,10 @@ extends TyperState(r) {
   private var myConstraint: Constraint = previous.constraint
 
   override def constraint = myConstraint
-  override def constraint_=(c: Constraint) = myConstraint = c
+  override def constraint_=(c: Constraint)(implicit ctx: Context) = {
+    if (Config.debugCheckConstraintsClosed && isGlobalCommittable) c.checkClosed()
+    myConstraint = c
+  }
 
   private var myEphemeral: Boolean = previous.ephemeral
 
@@ -164,17 +169,16 @@ extends TyperState(r) {
    *  found a better solution.
    */
   override def tryWithFallback[T](op: => T)(fallback: => T)(implicit ctx: Context): T = {
+    val storeReporter = new StoreReporter
     val savedReporter = myReporter
+    myReporter = storeReporter
     val savedConstraint = myConstraint
-    myReporter = new StoreReporter
-    val result = op
-    try
-      if (!reporter.hasErrors) result
-      else {
-        myConstraint = savedConstraint
-        fallback
-      }
-    finally myReporter = savedReporter
+    val result = try op finally myReporter = savedReporter
+    if (!storeReporter.hasErrors) result
+    else {
+      myConstraint = savedConstraint
+      fallback
+    }
   }
 
   override def toText(printer: Printer): Text = constraint.toText(printer)

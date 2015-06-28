@@ -6,7 +6,7 @@ import dotty.tools.dotc.ast.tpd
 import dotty.tools.dotc.core.Phases.Phase
 
 import scala.collection.mutable
-import scala.tools.asm.{ClassVisitor, MethodVisitor, FieldVisitor}
+import scala.tools.asm.{CustomAttr, ClassVisitor, MethodVisitor, FieldVisitor}
 import scala.tools.nsc.Settings
 import scala.tools.nsc.backend.jvm._
 import dotty.tools.dotc
@@ -27,6 +27,7 @@ import scala.tools.asm
 import scala.tools.asm.tree._
 import dotty.tools.dotc.util.{Positions, DotClass}
 import tpd._
+import StdNames._
 
 import scala.tools.nsc.backend.jvm.opt.LocalOpt
 
@@ -37,7 +38,7 @@ class GenBCode extends Phase {
 
 
   def run(implicit ctx: Context): Unit = {
-    new GenBCodePipeline(entryPoints.toList,  new DottyBackendInterface()(ctx))(ctx).run(ctx.compilationUnit.tpdTree)
+    new GenBCodePipeline(entryPoints.toList, new DottyBackendInterface()(ctx))(ctx).run(ctx.compilationUnit.tpdTree)
     entryPoints.clear()
   }
 }
@@ -115,7 +116,7 @@ class GenBCodePipeline(val entryPoints: List[Symbol], val int: DottyBackendInter
 
       val caseInsensitively = scala.collection.mutable.Map.empty[String, Symbol]
 
-      def run() {
+      def run(): Unit = {
         while (true) {
           val item = q1.poll
           if (item.isPoison) {
@@ -139,7 +140,7 @@ class GenBCodePipeline(val entryPoints: List[Symbol], val int: DottyBackendInter
        *  enqueues them in queue-2.
        *
        */
-      def visit(item: Item1) {
+      def visit(item: Item1) = {
         val Item1(arrivalPos, cd, cunit) = item
         val claszSymbol = cd.symbol
 
@@ -173,6 +174,13 @@ class GenBCodePipeline(val entryPoints: List[Symbol], val int: DottyBackendInter
         pcb.genPlainClass(cd)
         val outF = if (needsOutFolder) getOutFolder(claszSymbol, pcb.thisName) else null;
         val plainC = pcb.cnode
+
+        if (claszSymbol.isClass) // @DarkDimius is this test needed here?
+          for (pickler <- ctx.compilationUnit.picklers.get(claszSymbol.asClass)) {
+            val binary = pickler.assembleParts()
+            val dataAttr = new CustomAttr(nme.TASTYATTR.toString, binary)
+            plainC.visitAttribute(dataAttr)
+          }
 
         // -------------- bean info class, if needed --------------
         val beanC =
@@ -210,7 +218,7 @@ class GenBCodePipeline(val entryPoints: List[Symbol], val int: DottyBackendInter
         /*BackendStats.timed(BackendStats.methodOptTimer)*/(localOpt.methodOptimizations(classNode))
       }
 
-      def run() {
+      def run(): Unit = {
         while (true) {
           val item = q2.poll
           if (item.isPoison) {
@@ -230,7 +238,7 @@ class GenBCodePipeline(val entryPoints: List[Symbol], val int: DottyBackendInter
         }
       }
 
-      private def addToQ3(item: Item2) {
+      private def addToQ3(item: Item2) = {
 
         def getByteArray(cn: asm.tree.ClassNode): Array[Byte] = {
           val cw = new CClassWriter(extraProc)
@@ -269,7 +277,7 @@ class GenBCodePipeline(val entryPoints: List[Symbol], val int: DottyBackendInter
      *    (c) tear down (closing the classfile-writer and clearing maps)
      *
      */
-    def run(t: Tree) {
+    def run(t: Tree) = {
       this.tree = t
 
       // val bcodeStart = Statistics.startTimer(BackendStats.bcodeTimer)
@@ -313,7 +321,7 @@ class GenBCodePipeline(val entryPoints: List[Symbol], val int: DottyBackendInter
      *    (c) dequeue one at a time from queue-2, convert it to byte-array,    place in queue-3
      *    (d) serialize to disk by draining queue-3.
      */
-    private def buildAndSendToDisk(needsOutFolder: Boolean) {
+    private def buildAndSendToDisk(needsOutFolder: Boolean) = {
 
       feedPipeline1()
       // val genStart = Statistics.startTimer(BackendStats.bcodeGenStat)
@@ -329,12 +337,12 @@ class GenBCodePipeline(val entryPoints: List[Symbol], val int: DottyBackendInter
     }
 
     /* Feed pipeline-1: place all ClassDefs on q1, recording their arrival position. */
-    private def feedPipeline1() {
-      def gen(tree: Tree) {
+    private def feedPipeline1() = {
+      def gen(tree: Tree): Unit = {
         tree match {
           case EmptyTree            => ()
           case PackageDef(_, stats) => stats foreach gen
-          case ValDef(name, tpt, rhs) => () // module val not emmited
+          case ValDef(name, tpt, rhs) => () // module val not emitted
           case cd: TypeDef         =>
             q1 add Item1(arrivalPos, cd, int.currentUnit)
             arrivalPos += 1
@@ -345,9 +353,9 @@ class GenBCodePipeline(val entryPoints: List[Symbol], val int: DottyBackendInter
     }
 
     /* Pipeline that writes classfile representations to disk. */
-    private def drainQ3() {
+    private def drainQ3() = {
 
-      def sendToDisk(cfr: SubItem3, outFolder: scala.tools.nsc.io.AbstractFile) {
+      def sendToDisk(cfr: SubItem3, outFolder: scala.tools.nsc.io.AbstractFile): Unit = {
         if (cfr != null){
           val SubItem3(jclassName, jclassBytes) = cfr
           try {

@@ -50,6 +50,7 @@ object untpd extends Trees.Instance[Untyped] with UntypedTreeInfo {
     override def isTerm = trees.isEmpty || trees.head.isTerm
     override def isType = !isTerm
   }
+  case class Throw(expr: Tree) extends TermTree
   case class WhileDo(cond: Tree, body: Tree) extends TermTree
   case class DoWhile(body: Tree, cond: Tree) extends TermTree
   case class ForYield(enums: List[Tree], expr: Tree) extends TermTree
@@ -126,7 +127,6 @@ object untpd extends Trees.Instance[Untyped] with UntypedTreeInfo {
   def CaseDef(pat: Tree, guard: Tree, body: Tree): CaseDef = new CaseDef(pat, guard, body)
   def Return(expr: Tree, from: Tree): Return = new Return(expr, from)
   def Try(expr: Tree, cases: List[CaseDef], finalizer: Tree): Try = new Try(expr, cases, finalizer)
-  def Throw(expr: Tree): Throw = new Throw(expr)
   def SeqLiteral(elems: List[Tree]): SeqLiteral = new SeqLiteral(elems)
   def JavaSeqLiteral(elems: List[Tree]): JavaSeqLiteral = new JavaSeqLiteral(elems)
   def TypeTree(original: Tree): TypeTree = new TypeTree(original)
@@ -142,10 +142,10 @@ object untpd extends Trees.Instance[Untyped] with UntypedTreeInfo {
   def Bind(name: Name, body: Tree): Bind = new Bind(name, body)
   def Alternative(trees: List[Tree]): Alternative = new Alternative(trees)
   def UnApply(fun: Tree, implicits: List[Tree], patterns: List[Tree]): UnApply = new UnApply(fun, implicits, patterns)
-  def ValDef(name: TermName, tpt: Tree, rhs: Tree): ValDef = new ValDef(name, tpt, rhs)
-  def DefDef(name: TermName, tparams: List[TypeDef], vparamss: List[List[ValDef]], tpt: Tree, rhs: Tree): DefDef = new DefDef(name, tparams, vparamss, tpt, rhs)
+  def ValDef(name: TermName, tpt: Tree, rhs: LazyTree): ValDef = new ValDef(name, tpt, rhs)
+  def DefDef(name: TermName, tparams: List[TypeDef], vparamss: List[List[ValDef]], tpt: Tree, rhs: LazyTree): DefDef = new DefDef(name, tparams, vparamss, tpt, rhs)
   def TypeDef(name: TypeName, rhs: Tree): TypeDef = new TypeDef(name, rhs)
-  def Template(constr: DefDef, parents: List[Tree], self: ValDef, body: List[Tree]): Template = new Template(constr, parents, self, body)
+  def Template(constr: DefDef, parents: List[Tree], self: ValDef, body: LazyTreeList): Template = new Template(constr, parents, self, body)
   def Import(expr: Tree, selectors: List[untpd.Tree]): Import = new Import(expr, selectors)
   def PackageDef(pid: RefTree, stats: List[Tree]): PackageDef = new PackageDef(pid, stats)
   def Annotated(annot: Tree, arg: Tree): Annotated = new Annotated(annot, arg)
@@ -274,7 +274,7 @@ object untpd extends Trees.Instance[Untyped] with UntypedTreeInfo {
       case _ => new PolyTypeDef(name, tparams, rhs).withPos(tree.pos)
     }
     def SymbolLit(tree: Tree)(str: String) = tree match {
-      case tree: SymbolLit if (str == tree.str) => tree
+      case tree: SymbolLit if str == tree.str => tree
       case _ => untpd.SymbolLit(str).withPos(tree.pos)
     }
     def InterpolatedString(tree: Tree)(id: TermName, strings: List[Literal], elems: List[Tree]) = tree match {
@@ -298,12 +298,16 @@ object untpd extends Trees.Instance[Untyped] with UntypedTreeInfo {
       case _ => untpd.PrefixOp(op, od).withPos(tree.pos)
     }
     def Parens(tree: Tree)(t: Tree) = tree match {
-      case tree: Parens if (t eq tree.t) => tree
+      case tree: Parens if t eq tree.t => tree
       case _ => untpd.Parens(t).withPos(tree.pos)
     }
     def Tuple(tree: Tree)(trees: List[Tree]) = tree match {
-      case tree: Tuple if (trees eq tree.trees) => tree
+      case tree: Tuple if trees eq tree.trees => tree
       case _ => untpd.Tuple(trees).withPos(tree.pos)
+    }
+    def Throw(tree: Tree)(expr: Tree) = tree match {
+      case tree: Throw if expr eq tree.expr => tree
+      case _ => untpd.Throw(expr).withPos(tree.pos)
     }
     def WhileDo(tree: Tree)(cond: Tree, body: Tree) = tree match {
       case tree: WhileDo if (cond eq tree.cond) && (body eq tree.body) => tree
@@ -359,6 +363,8 @@ object untpd extends Trees.Instance[Untyped] with UntypedTreeInfo {
         cpy.Parens(tree)(transform(t))
       case Tuple(trees) =>
         cpy.Tuple(tree)(transform(trees))
+      case Throw(expr) =>
+        cpy.Throw(tree)(transform(expr))
       case WhileDo(cond, body) =>
         cpy.WhileDo(tree)(transform(cond), transform(body))
       case DoWhile(body, cond) =>
@@ -383,7 +389,7 @@ object untpd extends Trees.Instance[Untyped] with UntypedTreeInfo {
   }
 
   abstract class UntypedTreeAccumulator[X] extends TreeAccumulator[X] {
-    override def foldOver(x: X, tree: Tree): X = tree match {
+    override def foldOver(x: X, tree: Tree)(implicit ctx: Context): X = tree match {
       case ModuleDef(name, impl) =>
         this(x, impl)
       case SymbolLit(str) =>
@@ -402,6 +408,8 @@ object untpd extends Trees.Instance[Untyped] with UntypedTreeInfo {
         this(x, t)
       case Tuple(trees) =>
         this(x, trees)
+      case Throw(expr) =>
+        this(x, expr)
       case WhileDo(cond, body) =>
         this(this(x, cond), body)
       case DoWhile(body, cond) =>

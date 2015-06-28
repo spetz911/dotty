@@ -20,6 +20,7 @@ import util.{FreshNameCreator, SimpleMap, SourceFile, NoSource}
 import typer._
 import Implicits.ContextualImplicits
 import config.Settings._
+import config.Config
 import reporting._
 import collection.mutable
 import collection.immutable.BitSet
@@ -40,7 +41,7 @@ object Contexts {
    *      named `initctx`. They pass initctx to all positions where it is needed
    *      (and these positions should all be part of the intialization sequence of the class).
    *    - Classes that need contexts that survive initialization are instead passed
-   *      a "condensed context", typically named `cctx` (or they create one). Consensed contexts
+   *      a "condensed context", typically named `cctx` (or they create one). Condensed contexts
    *      just add some basic information to the context base without the
    *      risk of capturing complete trees.
    *    - To make sure these rules are kept, it would be good to do a sanity
@@ -164,13 +165,25 @@ object Contexts {
       _typeComparer
     }
 
+    /** Number of findMember calls on stack */
+    private[core] var findMemberCount: Int = 0
+
+    /** List of names which have a findMemberCall on stack,
+     *  after Config.LogPendingFindMemberThreshold is reached.
+     */
+    private[core] var pendingMemberSearches: List[Name] = Nil
+
     /** The new implicit references that are introduced by this scope */
     private var implicitsCache: ContextualImplicits = null
     def implicits: ContextualImplicits = {
       if (implicitsCache == null )
         implicitsCache = {
           val implicitRefs: List[TermRef] =
-            if (isClassDefContext) owner.thisType.implicitMembers
+            if (isClassDefContext)
+              try owner.thisType.implicitMembers
+              catch {
+                case ex: CyclicReference => Nil
+              }
             else if (isImportContext) importInfo.importedImplicits
             else if (isNonEmptyScopeContext) scope.implicitDecls
             else Nil
@@ -217,6 +230,9 @@ object Contexts {
 
     final def withPhase(phase: Phase): Context =
       withPhase(phase.id)
+
+    final def withPhaseNoLater(phase: Phase) =
+      if (ctx.phase.id > phase.id) withPhase(phase) else ctx
 
     /** If -Ydebug is on, the top of the stack trace where this context
      *  was created, otherwise `null`.
@@ -286,7 +302,7 @@ object Contexts {
      *  - At the same time the context should see the parameter accessors of the current class,
      *    that's why they get added to the local scope. An alternative would have been to have the
      *    context see the constructor parameters instead, but then we'd need a final substitution step
-     *    from constructor parameters to class paramater accessors.
+     *    from constructor parameters to class parameter accessors.
      */
     def superCallContext: Context = {
       val locals = newScopeWith(owner.asClass.paramAccessors: _*)
@@ -370,13 +386,6 @@ object Contexts {
     final def withOwner(owner: Symbol): Context =
       if (owner ne this.owner) fresh.setOwner(owner) else this
 
-    final def withMode(mode: Mode): Context =
-      if (mode != this.mode) fresh.setMode(mode) else this
-
-    final def addMode(mode: Mode): Context = withMode(this.mode | mode)
-    final def maskMode(mode: Mode): Context = withMode(this.mode & mode)
-    final def retractMode(mode: Mode): Context = withMode(this.mode &~ mode)
-
     override def toString =
       "Context(\n" +
       (outersIterator map ( ctx => s"  owner = ${ctx.owner}, scope = ${ctx.scope}") mkString "\n")
@@ -426,6 +435,21 @@ object Contexts {
     def setFreshGADTBounds: this.type = { this.gadt = new GADTMap(gadt.bounds); this }
 
     def setDebug = setSetting(base.settings.debug, true)
+  }
+
+  implicit class ModeChanges(val c: Context) extends AnyVal {
+    final def withMode(mode: Mode): Context =
+      if (mode != c.mode) c.fresh.setMode(mode) else c
+
+    final def addMode(mode: Mode): Context = withMode(c.mode | mode)
+    final def maskMode(mode: Mode): Context = withMode(c.mode & mode)
+    final def retractMode(mode: Mode): Context = withMode(c.mode &~ mode)
+  }
+
+  implicit class FreshModeChanges(val c: FreshContext) extends AnyVal {
+    final def addMode(mode: Mode): c.type = c.setMode(c.mode | mode)
+    final def maskMode(mode: Mode): c.type = c.setMode(c.mode & mode)
+    final def retractMode(mode: Mode): c.type = c.setMode(c.mode &~ mode)
   }
 
   /** A class defining the initial context with given context base
@@ -483,13 +507,13 @@ object Contexts {
     def rootLoader(root: TermSymbol)(implicit ctx: Context): SymbolLoader = platform.rootLoader(root)
 
     // Set up some phases to get started */
-    usePhases(List(List(SomePhase)))
+    usePhases(List(SomePhase))
 
     /** The standard definitions */
     val definitions = new Definitions
 
     def squashed(p: Phase): Phase = {
-      squashedPhases.find(_.period.containsPhaseId(p.id)).getOrElse(NoPhase)
+      allPhases.find(_.period.containsPhaseId(p.id)).getOrElse(NoPhase)
     }
   }
 
@@ -504,7 +528,7 @@ object Contexts {
     def nextId = { _nextId += 1; _nextId }
 
     /** A map from a superclass id to the typeref of the class that has it */
-    private[core] var classOfId = new Array[ClassSymbol](InitialSuperIdsSize)
+    private[core] var classOfId = new Array[ClassSymbol](Config.InitialSuperIdsSize)
 
     /** A map from a the typeref of a class to its superclass id */
     private[core] val superIdOfClass = new mutable.AnyRefMap[ClassSymbol, Int]
@@ -525,7 +549,7 @@ object Contexts {
 
     // Types state
     /** A table for hash consing unique types */
-    private[core] val uniques = new util.HashSet[Type](initialUniquesCapacity) {
+    private[core] val uniques = new util.HashSet[Type](Config.initialUniquesCapacity) {
       override def hash(x: Type): Int = x.hash
     }
 
@@ -556,12 +580,15 @@ object Contexts {
      *  of underlying during a controlled operation exists. */
     private[core] val pendingUnderlying = new mutable.HashSet[Type]
 
+
+    private[core] var phasesPlan: List[List[Phase]] = _
+
     // Phases state
     /** Phases by id */
     private[core] var phases: Array[Phase] = _
 
-    /** Phases with consecutive Transforms groupped into a single phase */
-    private [core] var squashedPhases: Array[Phase] = _
+    /** Phases with consecutive Transforms grouped into a single phase, Empty array if squashing is disabled */
+    private[core] var squashedPhases: Array[Phase] = Array.empty[Phase]
 
     /** Next denotation transformer id */
     private[core] var nextDenotTransformerId: Array[Int] = _
@@ -569,7 +596,7 @@ object Contexts {
     private[core] var denotTransformers: Array[DenotTransformer] = _
 
     // Printers state
-    /** Number of recursive invocations of a show method on cuyrrent stack */
+    /** Number of recursive invocations of a show method on current stack */
     private[dotc] var toTextRecursions = 0
 
     // Reporters state
@@ -593,7 +620,7 @@ object Contexts {
     /** implicit conversion that injects all ContextBase members into a context */
     implicit def toBase(ctx: Context): ContextBase = ctx.base
 
-    val theBase = new ContextBase // !!! DEBUG, so that we can use a minimal context for reporting even in code that normallly cannot access a context
+    val theBase = new ContextBase // !!! DEBUG, so that we can use a minimal context for reporting even in code that normally cannot access a context
   }
 
   /** Info that changes on each compiler run */
@@ -607,20 +634,4 @@ object Contexts {
       myBounds = myBounds.updated(sym, b)
     def bounds = myBounds
   }
-
-  /** Initial size of superId table */
-  private final val InitialSuperIdsSize = 4096
-
-  /** Initial capacity of uniques HashMap */
-  private[core] final val initialUniquesCapacity = 40000
-
-  /** How many recursive calls to NamedType#underlying are performed before
-   *  logging starts.
-   */
-  private[core] final val LogPendingUnderlyingThreshold = 50
-
-  /** How many recursive calls to isSubType are performed before
-   *  logging starts.
-   */
-  private[core] final val LogPendingSubTypesThreshold = 50
 }

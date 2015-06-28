@@ -1,6 +1,8 @@
 package dotty.tools.dotc
 package transform
 
+import dotty.tools.dotc.typer.Mode
+
 import scala.collection.mutable
 import core._
 import Contexts._
@@ -12,70 +14,79 @@ import dotty.tools.dotc.transform.TreeTransforms.{TransformerInfo, TreeTransform
 import dotty.tools.dotc.ast.Trees._
 import dotty.tools.dotc.ast.{untpd, tpd}
 import dotty.tools.dotc.core.Constants.Constant
-import dotty.tools.dotc.core.Types.MethodType
+import dotty.tools.dotc.core.Types.{ExprType, NoType, MethodType}
 import dotty.tools.dotc.core.Names.Name
-import dotty.runtime.LazyVals
 import SymUtils._
 import scala.collection.mutable.ListBuffer
 import dotty.tools.dotc.core.Denotations.SingleDenotation
 import dotty.tools.dotc.core.SymDenotations.SymDenotation
-import dotty.tools.dotc.core.DenotTransformers.{IdentityDenotTransformer, DenotTransformer}
+import dotty.tools.dotc.core.DenotTransformers.{SymTransformer, IdentityDenotTransformer, DenotTransformer}
+import Erasure.Boxing.adaptToType
 
-class LazyValsTransform extends MiniPhaseTransform with IdentityDenotTransformer {
+class LazyVals extends MiniPhaseTransform with IdentityDenotTransformer {
+  import LazyVals._
 
   import tpd._
 
+  def transformer = new LazyVals
 
-  def transformer = new LazyValsTransform
+  val containerFlags = Flags.Synthetic | Flags.Mutable | Flags.Lazy
+  val initFlags      = Flags.Synthetic | Flags.Method
 
-  val containerFlags = Flags.Synthetic | Flags.Mutable
+  val containerFlagsMask = Flags.Method | Flags.Lazy | Flags.Accessor | Flags.Module
 
   /** this map contains mutable state of transformation: OffsetDefs to be appended to companion object definitions,
     * and number of bits currently used */
   class OffsetInfo(var defs: List[Tree], var ord:Int)
-  val appendOffsetDefs = mutable.Map.empty[Name, OffsetInfo]
+  val appendOffsetDefs = mutable.Map.empty[Symbol, OffsetInfo]
 
   override def phaseName: String = "LazyVals"
 
-    /** List of names of phases that should have finished processing of tree
-      * before this phase starts processing same tree */
-    // override def ensureAfter: Set[String] = Set("mixin")
+  /** List of names of phases that should have finished processing of tree
+    * before this phase starts processing same tree */
+  override def runsAfter = Set(classOf[Mixin])
 
-    override def transformValDef(tree: ValDef)(implicit ctx: Context, info: TransformerInfo): Tree = {
-      if (!(tree.mods is Flags.Lazy) || (tree.mods is Flags.ModuleVal)) tree
+    override def transformDefDef(tree: DefDef)(implicit ctx: Context, info: TransformerInfo): Tree = {
+      if (!(tree.symbol is Flags.Lazy) || tree.symbol.owner.is(Flags.Trait)) tree
       else {
-        val isField = tree.symbol.owner.isClass
+          val isField = tree.symbol.owner.isClass
 
-        if (isField) {
-          if (tree.symbol.isVolatile) transformFieldValDefVolatile(tree)
-          else transformFieldValDefNonVolatile(tree)
-        }
-        else transformLocalValDef(tree)
+          if (isField) {
+            if (tree.symbol.isVolatile || tree.symbol.is(Flags.Module)) transformMemberDefVolatile(tree)
+            else transformMemberDefNonVolatile(tree)
+          }
+          else transformLocalDef(tree)
       }
     }
 
-    /** Append offset fields to companion objects
-     */
-    override def transformTypeDef(tree: TypeDef)(implicit ctx: Context, info: TransformerInfo): Tree = {
-      if (!tree.symbol.isClass) tree
-      else {
-        appendOffsetDefs.get(tree.symbol.name) match {
-          case None => tree
-          case Some(data) =>
-            val template = tree.rhs.asInstanceOf[Template]
-            ClassDef(tree.symbol.asClass, template.constr, data.defs.mapConserve(transformFollowingDeep) ::: template.body)
-        }
-      }
+
+  /** Append offset fields to companion objects
+    */
+  override def transformTemplate(template: tpd.Template)(implicit ctx: Context, info: TransformerInfo): tpd.Tree = {
+    val cls = ctx.owner.asClass
+
+    appendOffsetDefs.get(cls) match {
+      case None => template
+      case Some(data) =>
+        cpy.Template(template)(body = addInFront(data.defs, template.body))
     }
+
+  }
+
+  private def addInFront(prefix: List[Tree], stats: List[Tree]) = stats match {
+    case first :: rest if isSuperConstrCall(first) => first :: prefix ::: rest
+    case _ => prefix ::: stats
+  }
+
     /** Replace a local lazy val inside a method,
       * with a LazyHolder from
       * dotty.runtime(eg dotty.runtime.LazyInt)
       */
-    def transformLocalValDef(x: ValDef)(implicit ctx: Context) = x match {
-      case x@ValDef(name, tpt, rhs) =>
-        val valueInitter = rhs
-        val holderName = ctx.freshName(name.toString + StdNames.nme.LAZY_LOCAL).toTermName
-        val tpe = x.tpe.widen
+    def transformLocalDef(x: DefDef)(implicit ctx: Context) = {
+        val valueInitter = x.rhs
+        val holderName = ctx.freshName(x.name ++ StdNames.nme.LAZY_LOCAL).toTermName
+        val initName = ctx.freshName(x.name ++ StdNames.nme.LAZY_LOCAL_INIT).toTermName
+        val tpe = x.tpe.widen.resultType.widen
 
         val holderType =
           if (tpe isRef defn.IntClass) "LazyInt"
@@ -88,21 +99,46 @@ class LazyValsTransform extends MiniPhaseTransform with IdentityDenotTransformer
           else if (tpe isRef defn.ShortClass) "LazyShort"
           else "LazyRef"
 
+
         val holderImpl = ctx.requiredClass("dotty.runtime." + holderType)
 
-        val holderSymbol = ctx.newSymbol(x.symbol.owner, holderName, containerFlags, holderImpl.typeRef, coord = x.symbol.coord)
-        val holderTree = ValDef(holderSymbol, New(holderImpl.typeRef, List(valueInitter.changeOwner(x.symbol, holderSymbol))))
-        val methodBody = {
-          val prefix = ref(holderSymbol).select("value".toTermName)
-          if (holderType != "LazyRef") prefix
-          else prefix.select(defn.Any_asInstanceOf).appliedToType(tpe)
-          }
+        val holderSymbol = ctx.newSymbol(x.symbol.owner, holderName, containerFlags, holderImpl.typeRef, coord = x.pos)
+        val initSymbol = ctx.newSymbol(x.symbol.owner, initName, initFlags, MethodType(Nil, tpe), coord = x.pos)
+        val result = ref(holderSymbol).select(lazyNme.value)
+        val flag = ref(holderSymbol).select(lazyNme.initialized)
+        val initer = valueInitter.changeOwner(x.symbol, initSymbol)
+        val initBody =
+          adaptToType(
+            ref(holderSymbol).select(defn.Object_synchronized).appliedTo(
+              adaptToType(mkNonThreadSafeDef(result, flag, initer), defn.ObjectType)),
+            tpe)
+        val initTree = DefDef(initSymbol, initBody)
+        val holderTree = ValDef(holderSymbol, New(holderImpl.typeRef, List()))
+        val methodBody = tpd.If(flag.ensureApplied,
+          result.ensureApplied,
+          ref(initSymbol).ensureApplied).ensureConforms(tpe)
+
         val methodTree = DefDef(x.symbol.asTerm, methodBody)
         ctx.debuglog(s"found a lazy val ${x.show},\n rewrote with ${holderTree.show}")
-        Thicket(holderTree, methodTree)
+        Thicket(holderTree, initTree, methodTree)
     }
 
-    /** Create non-threadsafe lazy accessor equivalent to such code
+
+  override def transformStats(trees: List[tpd.Tree])(implicit ctx: Context, info: TransformerInfo): List[tpd.Tree] = {
+    // backend requires field usage to be after field definition
+    // need to bring containers to start of method
+    val (holders, stats) =
+      atGroupEnd { implicit ctx: Context =>
+        trees.partition {
+          _.symbol.flags.&~(Flags.Touched) == containerFlags
+          // Filtering out Flags.Touched is not required currently, as there are no LazyTypes involved here
+          // but just to be more safe
+        }
+      }
+    holders:::stats
+  }
+
+  /** Create non-threadsafe lazy accessor equivalent to such code
       * def methodSymbol() = {
       *   if (flag) target
       *   else {
@@ -113,13 +149,11 @@ class LazyValsTransform extends MiniPhaseTransform with IdentityDenotTransformer
       *   }
       */
 
-    def mkNonThreadSafeDef(target: Symbol, flag: Symbol, rhs: Tree)(implicit ctx: Context) = {
-      val cond = ref(flag)
-      val exp = ref(target)
-      val setFlag = Assign(cond, Literal(Constants.Constant(true)))
-      val setTarget = Assign(exp, rhs)
-      val init = Block(List(setFlag, setTarget), exp)
-      If(cond, exp, init)
+    def mkNonThreadSafeDef(target: Tree, flag: Tree, rhs: Tree)(implicit ctx: Context) = {
+      val setFlag = flag.becomes(Literal(Constants.Constant(true)))
+      val setTargets = if (isWildcardArg(rhs)) Nil else target.becomes(rhs) :: Nil
+      val init = Block(setFlag :: setTargets, target.ensureApplied)
+      If(flag.ensureApplied, target.ensureApplied, init)
     }
 
     /** Create non-threadsafe lazy accessor for not-nullable types  equivalent to such code
@@ -133,35 +167,36 @@ class LazyValsTransform extends MiniPhaseTransform with IdentityDenotTransformer
     def mkDefNonThreadSafeNonNullable(target: Symbol, rhs: Tree)(implicit ctx: Context) = {
       val cond = ref(target).select(nme.eq).appliedTo(Literal(Constant(null)))
       val exp = ref(target)
-      val setTarget = Assign(exp, rhs)
+      val setTarget = exp.becomes(rhs)
       val init = Block(List(setTarget), exp)
       If(cond, init, exp)
     }
 
-    def transformFieldValDefNonVolatile(x: ValDef)(implicit ctx: Context) = x match {
-      case x@ValDef(name, tpt, rhs) if (x.mods is Flags.Lazy) =>
+    def transformMemberDefNonVolatile(x: DefDef)(implicit ctx: Context) = {
         val claz = x.symbol.owner.asClass
-        val tpe = x.tpe.widen
+        val tpe = x.tpe.widen.resultType.widen
         assert(!(x.mods is Flags.Mutable))
-        val containerName = ctx.freshName(name.toString + StdNames.nme.LAZY_LOCAL).toTermName
-        val containerSymbol = ctx.newSymbol(claz, containerName, (x.mods &~ Flags.Lazy | containerFlags).flags, tpe, coord = x.symbol.coord).enteredAfter(this)
+        val containerName = ctx.freshName(x.name ++ StdNames.nme.LAZY_LOCAL).toTermName
+        val containerSymbol = ctx.newSymbol(claz, containerName,
+          x.symbol.flags &~ containerFlagsMask | containerFlags | Flags.Private,
+          tpe, coord = x.symbol.coord
+        ).enteredAfter(this)
 
-        val containerTree = ValDef(containerSymbol, initValue(tpe))
-        if (x.tpe.isNotNull && tpe <:< defn.AnyRefType) { // can use 'null' value instead of flag
-          val slowPath = DefDef(x.symbol.asTerm, mkDefNonThreadSafeNonNullable(containerSymbol, rhs))
+        val containerTree = ValDef(containerSymbol, defaultValue(tpe))
+        if (x.tpe.isNotNull && tpe <:< defn.ObjectType) { // can use 'null' value instead of flag
+          val slowPath = DefDef(x.symbol.asTerm, mkDefNonThreadSafeNonNullable(containerSymbol, x.rhs))
           Thicket(List(containerTree, slowPath))
         }
         else {
-          val flagName = ctx.freshName(name.toString + StdNames.nme.BITMAP_PREFIX).toTermName
-          val flagSymbol = ctx.newSymbol(x.symbol.owner, flagName,  containerFlags, defn.BooleanType)
+          val flagName = ctx.freshName(x.name ++ StdNames.nme.BITMAP_PREFIX).toTermName
+          val flagSymbol = ctx.newSymbol(x.symbol.owner, flagName,  containerFlags | Flags.Private, defn.BooleanType).enteredAfter(this)
           val flag = ValDef(flagSymbol, Literal(Constants.Constant(false)))
-          val slowPath = DefDef(x.symbol.asTerm, mkNonThreadSafeDef(containerSymbol, flagSymbol, rhs))
+          val slowPath = DefDef(x.symbol.asTerm, mkNonThreadSafeDef(ref(containerSymbol), ref(flagSymbol), x.rhs))
           Thicket(List(containerTree, flag, slowPath))
         }
-
     }
 
-    /** Create non-threadsafe lazy accessor equivalent to such code
+    /** Create a threadsafe lazy accessor equivalent to such code
       *
       * def methodSymbol(): Int = {
       *   val result: Int = 0
@@ -192,39 +227,38 @@ class LazyValsTransform extends MiniPhaseTransform with IdentityDenotTransformer
       *     }
       *   result
       * }
-      * FIXME: Don't use strings with toTermName, use predefined names instead.
       */
     def mkThreadSafeDef(methodSymbol: TermSymbol, claz: ClassSymbol, ord: Int, target: Symbol, rhs: Tree, tp: Types.Type, offset: Tree, getFlag: Tree, stateMask: Tree, casFlag: Tree, setFlagState: Tree, waitOnLock: Tree)(implicit ctx: Context) = {
       val initState = Literal(Constants.Constant(0))
       val computeState = Literal(Constants.Constant(1))
       val notifyState = Literal(Constants.Constant(2))
       val computedState = Literal(Constants.Constant(3))
-      val flagSymbol = ctx.newSymbol(methodSymbol, "flag".toTermName, containerFlags, defn.LongType)
+      val flagSymbol = ctx.newSymbol(methodSymbol, lazyNme.flag, containerFlags, defn.LongType)
       val flagDef = ValDef(flagSymbol, Literal(Constant(0L)))
 
       val thiz = This(claz)(ctx.fresh.setOwner(claz))
 
-      val resultSymbol = ctx.newSymbol(methodSymbol, "result".toTermName, containerFlags, tp)
-      val resultDef = ValDef(resultSymbol, initValue(tp))
+      val resultSymbol = ctx.newSymbol(methodSymbol, lazyNme.result, containerFlags, tp)
+      val resultDef = ValDef(resultSymbol, defaultValue(tp))
 
-      val retrySymbol = ctx.newSymbol(methodSymbol, "retry".toTermName, containerFlags, defn.BooleanType)
+      val retrySymbol = ctx.newSymbol(methodSymbol, lazyNme.retry, containerFlags, defn.BooleanType)
       val retryDef = ValDef(retrySymbol, Literal(Constants.Constant(true)))
 
       val whileCond = ref(retrySymbol)
 
       val compute = {
-        val handlerSymbol = ctx.newSymbol(methodSymbol, "$anonfun".toTermName, Flags.Synthetic,
-          MethodType(List("x$1".toTermName), List(defn.ThrowableType), defn.IntType))
+        val handlerSymbol = ctx.newSymbol(methodSymbol, nme.ANON_FUN, Flags.Synthetic,
+          MethodType(List(nme.x_1), List(defn.ThrowableType), defn.IntType))
         val caseSymbol = ctx.newSymbol(methodSymbol, nme.DEFAULT_EXCEPTION_NAME, Flags.Synthetic, defn.ThrowableType)
         val complete = setFlagState.appliedTo(thiz, offset, initState, Literal(Constant(ord)))
         val handler = CaseDef(Bind(caseSymbol, ref(caseSymbol)), EmptyTree,
           Block(List(complete), Throw(ref(caseSymbol))
         ))
 
-        val compute = Assign(ref(resultSymbol), rhs)
+        val compute = ref(resultSymbol).becomes(rhs)
         val tr = Try(compute, List(handler), EmptyTree)
-        val assign = Assign(ref(target), ref(resultSymbol))
-        val noRetry = Assign(ref(retrySymbol), Literal(Constants.Constant(false)))
+        val assign = ref(target).becomes(ref(resultSymbol))
+        val noRetry = ref(retrySymbol).becomes(Literal(Constants.Constant(false)))
         val body = If(casFlag.appliedTo(thiz, offset, ref(flagSymbol), computeState, Literal(Constant(ord))),
           Block(tr :: assign :: complete :: noRetry :: Nil, Literal(Constant(()))),
           Literal(Constant(())))
@@ -243,42 +277,43 @@ class LazyValsTransform extends MiniPhaseTransform with IdentityDenotTransformer
       }
 
       val computed = {
-        val noRetry = Assign(ref(retrySymbol), Literal(Constants.Constant(false)))
-        val result = Assign(ref(resultSymbol), ref(target))
+        val noRetry = ref(retrySymbol).becomes(Literal(Constants.Constant(false)))
+        val result = ref(resultSymbol).becomes(ref(target))
         val body = Block(noRetry :: result :: Nil, Literal(Constant(())))
         CaseDef(computedState, EmptyTree, body)
       }
 
-      val cases = Match(stateMask.appliedTo(ref(flagSymbol), Literal(Constant(ord))),
-        List(compute, waitFirst, waitSecond, computed)) //todo: annotate with @switch
+      val default = CaseDef(Underscore(defn.LongType), EmptyTree, Literal(Constant(())))
 
-      val whileBody = Block(List(Assign(ref(flagSymbol), getFlag.appliedTo(thiz, offset))), cases)
-      val cycle = untpd.WhileDo(whileCond, whileBody).withTypeUnchecked(defn.UnitType)
+      val cases = Match(stateMask.appliedTo(ref(flagSymbol), Literal(Constant(ord))),
+        List(compute, waitFirst, waitSecond, computed, default)) //todo: annotate with @switch
+
+      val whileBody = List(ref(flagSymbol).becomes(getFlag.appliedTo(thiz, offset)), cases)
+      val cycle = WhileDo(methodSymbol, whileCond, whileBody)
       DefDef(methodSymbol, Block(resultDef :: retryDef :: flagDef :: cycle :: Nil, ref(resultSymbol)))
     }
 
-    def transformFieldValDefVolatile(x: ValDef)(implicit ctx: Context) = x match {
-      case x@ValDef(name, tpt, rhs) if (x.mods is Flags.Lazy) =>
+    def transformMemberDefVolatile(x: DefDef)(implicit ctx: Context) = {
         assert(!(x.mods is Flags.Mutable))
 
-        val tpe = x.tpe.widen
+        val tpe = x.tpe.widen.resultType.widen
         val claz = x.symbol.owner.asClass
-        val thiz = This(claz)(ctx.fresh.setOwner(claz))
+        val thizClass = Literal(Constant(claz.info))
         val companion = claz.companionModule
         val helperModule = ctx.requiredModule("dotty.runtime.LazyVals")
-        val getOffset = Select(ref(helperModule), LazyVals.Names.getOffset.toTermName)
+        val getOffset = Select(ref(helperModule), lazyNme.RLazyVals.getOffset)
         var offsetSymbol: TermSymbol = null
         var flag: Tree = EmptyTree
         var ord = 0
 
         // compute or create appropriate offsetSymol, bitmap and bits used by current ValDef
-        appendOffsetDefs.get(companion.name.moduleClassName) match {
+        appendOffsetDefs.get(companion.moduleClass) match {
           case Some(info) =>
-            val flagsPerLong = 64 / LazyVals.BITS_PER_LAZY_VAL
+            val flagsPerLong = 64 / dotty.runtime.LazyVals.BITS_PER_LAZY_VAL
             info.ord += 1
             ord = info.ord % flagsPerLong
             val id = info.ord / flagsPerLong
-            if(ord != 0) { // there are unused bits in already existing flag
+            if (ord != 0) { // there are unused bits in already existing flag
               offsetSymbol = companion.moduleClass.info.decl((StdNames.nme.LAZY_FIELD_OFFSET + id.toString).toTermName)
                 .suchThat(sym => (sym is Flags.Synthetic) && sym.isTerm)
                  .symbol.asTerm
@@ -287,7 +322,7 @@ class LazyValsTransform extends MiniPhaseTransform with IdentityDenotTransformer
               val flagName = (StdNames.nme.BITMAP_PREFIX + id.toString).toTermName
               val flagSymbol = ctx.newSymbol(claz, flagName, containerFlags, defn.LongType).enteredAfter(this)
               flag = ValDef(flagSymbol, Literal(Constants.Constant(0L)))
-              val offsetTree = ValDef(offsetSymbol, getOffset.appliedTo(thiz, Literal(Constant(flagName.toString))))
+              val offsetTree = ValDef(offsetSymbol, getOffset.appliedTo(thizClass, Literal(Constant(flagName.toString))))
               info.defs = offsetTree :: info.defs
             }
 
@@ -296,26 +331,45 @@ class LazyValsTransform extends MiniPhaseTransform with IdentityDenotTransformer
             val flagName = (StdNames.nme.BITMAP_PREFIX + "0").toTermName
             val flagSymbol = ctx.newSymbol(claz, flagName, containerFlags, defn.LongType).enteredAfter(this)
             flag = ValDef(flagSymbol, Literal(Constants.Constant(0L)))
-            val offsetTree = ValDef(offsetSymbol, getOffset.appliedTo(thiz, Literal(Constant(flagName.toString))))
-            appendOffsetDefs += (companion.name.moduleClassName -> new OffsetInfo(List(offsetTree), ord))
+            val offsetTree = ValDef(offsetSymbol, getOffset.appliedTo(thizClass, Literal(Constant(flagName.toString))))
+            appendOffsetDefs += (companion.moduleClass -> new OffsetInfo(List(offsetTree), ord))
         }
 
-        val containerName = ctx.freshName(name.toString + StdNames.nme.LAZY_LOCAL).toTermName
-        val containerSymbol = ctx.newSymbol(claz, containerName, (x.mods &~ Flags.Lazy | containerFlags).flags, tpe, coord = x.symbol.coord).enteredAfter(this)
-        val containerTree = ValDef(containerSymbol, initValue(tpe))
+        val containerName = ctx.freshName(x.name ++ StdNames.nme.LAZY_LOCAL).toTermName
+        val containerSymbol = ctx.newSymbol(claz, containerName, (x.mods &~ containerFlagsMask | containerFlags).flags, tpe, coord = x.symbol.coord).enteredAfter(this)
+        val containerTree = ValDef(containerSymbol, defaultValue(tpe))
 
-        val offset = Select(ref(companion), offsetSymbol.name)
-        val getFlag = Select(ref(helperModule), LazyVals.Names.get.toTermName)
-        val setFlag = Select(ref(helperModule), LazyVals.Names.setFlag.toTermName)
-        val wait = Select(ref(helperModule), LazyVals.Names.wait4Notification.toTermName)
-        val state = Select(ref(helperModule), LazyVals.Names.state.toTermName)
-        val cas = Select(ref(helperModule), LazyVals.Names.cas.toTermName)
+        val offset =  ref(companion).ensureApplied.select(offsetSymbol)
+        val getFlag = Select(ref(helperModule), lazyNme.RLazyVals.get)
+        val setFlag = Select(ref(helperModule), lazyNme.RLazyVals.setFlag)
+        val wait =    Select(ref(helperModule), lazyNme.RLazyVals.wait4Notification)
+        val state =   Select(ref(helperModule), lazyNme.RLazyVals.state)
+        val cas =     Select(ref(helperModule), lazyNme.RLazyVals.cas)
 
-        val accessor = mkThreadSafeDef(x.symbol.asTerm, claz, ord, containerSymbol, rhs, tpe, offset, getFlag, state, cas, setFlag, wait)
-        if(flag eq EmptyTree)
+        val accessor = mkThreadSafeDef(x.symbol.asTerm, claz, ord, containerSymbol, x.rhs, tpe, offset, getFlag, state, cas, setFlag, wait)
+        if (flag eq EmptyTree)
           Thicket(List(containerTree, accessor))
         else Thicket(List(containerTree, flag, accessor))
     }
+}
+
+object LazyVals {
+  object lazyNme {
+    object RLazyVals {
+      import dotty.runtime.LazyVals._
+      val get               = Names.get.toTermName
+      val setFlag           = Names.setFlag.toTermName
+      val wait4Notification = Names.wait4Notification.toTermName
+      val state             = Names.state.toTermName
+      val cas               = Names.cas.toTermName
+      val getOffset         = Names.getOffset.toTermName
+    }
+    val flag        = "flag".toTermName
+    val result      = "result".toTermName
+    val value       = "value".toTermName
+    val initialized = "initialized".toTermName
+    val retry       = "retry".toTermName
+  }
 }
 
 

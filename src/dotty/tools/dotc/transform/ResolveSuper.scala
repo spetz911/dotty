@@ -48,6 +48,9 @@ class ResolveSuper extends MiniPhaseTransform with IdentityDenotTransformer { th
 
   override def phaseName: String = "resolveSuper"
 
+  override def runsAfter = Set(classOf[ElimByName], // verified empirically, need to figure out what the reason is.
+                               classOf[AugmentScala2Traits])
+
   /** Returns the symbol that is accessed by a super-accessor in a mixin composition.
    *
    *  @param base       The class in which everything is mixed together
@@ -78,15 +81,9 @@ class ResolveSuper extends MiniPhaseTransform with IdentityDenotTransformer { th
       for (superAcc <- mixin.info.decls.filter(_ is SuperAccessor).toList)
         yield polyDefDef(implementation(superAcc.asTerm), forwarder(rebindSuper(cls, superAcc)))
 
-    def methodOverrides(mixin: ClassSymbol): List[Tree] = {
-      def isOverridden(meth: Symbol) = meth.overridingSymbol(cls).is(Method, butNot = Deferred)
-      def needsDisambiguation(meth: Symbol): Boolean =
-        meth.is(Method, butNot = PrivateOrDeferred) &&
-          !isOverridden(meth) &&
-          !meth.allOverriddenSymbols.forall(_ is Deferred)
-      for (meth <- mixin.info.decls.toList if needsDisambiguation(meth))
+    def methodOverrides(mixin: ClassSymbol): List[Tree] =
+      for (meth <- mixin.info.decls.toList if needsForwarder(meth))
         yield polyDefDef(implementation(meth.asTerm), forwarder(meth))
-    }
 
     val overrides = mixins.flatMap(mixin => superAccessors(mixin) ::: methodOverrides(mixin))
 
@@ -105,5 +102,5 @@ class ResolveSuper extends MiniPhaseTransform with IdentityDenotTransformer { th
     else ddef
   }
 
-  private val PrivateOrDeferred = Private | Deferred
+  private val PrivateOrAccessorOrDeferred = Private | Accessor | Deferred
 }

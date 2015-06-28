@@ -20,6 +20,7 @@ import annotation.unchecked
 import util.Positions._
 import util.{Stats, SimpleMap}
 import util.common._
+import transform.SymUtils._
 import Decorators._
 import Uniques._
 import ErrorReporting.{err, errorType, DiagnosticString}
@@ -39,6 +40,26 @@ object Checking {
           d"Type argument ${arg.tpe} does not conform to $which bound $bound ${err.whyNoMatchStr(arg.tpe, bound)}",
           arg.pos)
 
+  /** Check that `tp` refers to a nonAbstract class
+   *  and that the instance conforms to the self type of the created class.
+   */
+  def checkInstantiable(tp: Type, pos: Position)(implicit ctx: Context): Unit =
+    tp.underlyingClassRef(refinementOK = false) match {
+      case tref: TypeRef =>
+        val cls = tref.symbol
+        if (cls.is(AbstractOrTrait))
+          ctx.error(d"$cls is abstract; cannot be instantiated", pos)
+        if (!cls.is(Module)) {
+          // Create a synthetic singleton type instance, and check whether
+          // it conforms to the self type of the class as seen from that instance.
+          val stp = SkolemType(tp)
+          val selfType = tref.givenSelfType.asSeenFrom(stp, cls)
+          if (selfType.exists && !(stp <:< selfType))
+            ctx.error(d"$tp does not conform to its self type $selfType; cannot be instantiated")
+        }
+      case _ =>
+    }
+
   /** A type map which checks that the only cycles in a type are F-bounds
    *  and that protects all F-bounded references by LazyRefs.
    */
@@ -47,7 +68,7 @@ object Checking {
     /** Are cycles allowed within nested refinedInfos of currently checked type? */
     private var nestedCycleOK = false
 
-    /** Are cycles allwoed within currently checked type? */
+    /** Are cycles allowed within currently checked type? */
     private var cycleOK = false
 
     /** A diagnostic output string that indicates the position of the last
@@ -169,7 +190,7 @@ object Checking {
     val checkTree = new TreeAccumulator[Unit] {
       def checkRef(tree: Tree, sym: Symbol) =
         if (sym.maybeOwner == refineCls && !seen(sym)) forwardRef(tree)
-      def apply(x: Unit, tree: Tree) = tree match {
+      def apply(x: Unit, tree: Tree)(implicit ctx: Context) = tree match {
         case tree: MemberDef =>
           foldOver(x, tree)
           seen += tree.symbol
@@ -232,13 +253,8 @@ trait Checking {
 
   /** Check that type `tp` is stable. */
   def checkStable(tp: Type, pos: Position)(implicit ctx: Context): Unit =
-    if (!tp.isStable) ctx.error(d"$tp is not stable", pos)
-
-  /** Check that type `tp` is a legal prefix for '#'.
-   *  @return The type itself
-   */
-  def checkLegalPrefix(tp: Type, selector: Name, pos: Position)(implicit ctx: Context): Unit =
-    if (!tp.isLegalPrefixFor(selector)) ctx.error(d"$tp is not a valid prefix for '# $selector'", pos)
+    if (!tp.isStable && !tp.isErroneous)
+      ctx.error(d"$tp is not stable", pos)
 
  /**  Check that `tp` is a class type with a stable prefix. Also, if `traitReq` is
    *  true check that `tp` is a trait.
@@ -294,8 +310,8 @@ trait Checking {
           def doubleDefError(decl: Symbol, other: Symbol): Unit = {
             def ofType = if (decl.isType) "" else d": ${other.info}"
             def explanation =
-              if (!decl.isSourceMethod) ""
-              else "\n (both definitions have the same erased type signature)"
+              if (!decl.isRealMethod) ""
+              else "\n (the definitions have matching type signatures)"
             ctx.error(d"$decl is already defined as $other$ofType$explanation", decl.pos)
           }
           if (decl is Synthetic) doubleDefError(other, decl)
@@ -316,9 +332,15 @@ trait Checking {
     }
   }
 
-  def checkInstantiatable(cls: ClassSymbol, pos: Position): Unit = {
-    ??? // to be done in later phase: check that class `cls` is legal in a new.
-  }
+  def checkParentCall(call: Tree, caller: ClassSymbol)(implicit ctx: Context) =
+    if (!ctx.isAfterTyper) {
+      val called = call.tpe.classSymbol
+      if (caller is Trait)
+        ctx.error(i"$caller may not call constructor of $called", call.pos)
+      else if (called.is(Trait) && !caller.mixins.contains(called))
+        ctx.error(i"""$called is already implemented by super${caller.superClass},
+                   |its constructor cannot be called again""".stripMargin, call.pos)
+    }
 }
 
 trait NoChecking extends Checking {
@@ -327,9 +349,9 @@ trait NoChecking extends Checking {
   override def checkValue(tree: Tree, proto: Type)(implicit ctx: Context): tree.type = tree
   override def checkBounds(args: List[tpd.Tree], poly: PolyType)(implicit ctx: Context): Unit = ()
   override def checkStable(tp: Type, pos: Position)(implicit ctx: Context): Unit = ()
-  override def checkLegalPrefix(tp: Type, selector: Name, pos: Position)(implicit ctx: Context): Unit = ()
   override def checkClassTypeWithStablePrefix(tp: Type, pos: Position, traitReq: Boolean)(implicit ctx: Context): Type = tp
   override def checkImplicitParamsNotSingletons(vparamss: List[List[ValDef]])(implicit ctx: Context): Unit = ()
   override def checkFeasible(tp: Type, pos: Position, where: => String = "")(implicit ctx: Context): Type = tp
   override def checkNoDoubleDefs(cls: Symbol)(implicit ctx: Context): Unit = ()
+  override def checkParentCall(call: Tree, caller: ClassSymbol)(implicit ctx: Context) = ()
 }

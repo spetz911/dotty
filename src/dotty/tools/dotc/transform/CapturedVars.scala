@@ -29,7 +29,7 @@ class CapturedVars extends MiniPhase with IdentityDenotTransformer { thisTransfo
 
     private class CollectCaptured(implicit ctx: Context) extends EnclosingMethodTraverser {
       private val captured = mutable.HashSet[Symbol]()
-      def traverse(enclMeth: Symbol, tree: Tree) = tree match {
+      def traverse(enclMeth: Symbol, tree: Tree)(implicit ctx: Context) = tree match {
         case id: Ident =>
           val sym = id.symbol
           if (sym.is(Mutable, butNot = Method) && sym.owner.isTerm && sym.enclosingMethod != enclMeth) {
@@ -59,16 +59,12 @@ class CapturedVars extends MiniPhase with IdentityDenotTransformer { thisTransfo
       refMap.getOrElse(cls, refMap(defn.ObjectClass))
     }
 
-    def capturedType(vble: Symbol)(implicit ctx: Context): Type = {
-      val oldInfo = vble.denot(ctx.withPhase(thisTransform)).info
-      refCls(oldInfo.classSymbol, vble.isVolatile).typeRef
-    }
-
     override def prepareForValDef(vdef: ValDef)(implicit ctx: Context) = {
       val sym = vdef.symbol
       if (captured contains sym) {
         val newd = sym.denot(ctx.withPhase(thisTransform)).copySymDenotation(
-          info = refCls(sym.info.classSymbol, sym.hasAnnotation(defn.VolatileAnnot)).typeRef)
+          info = refCls(sym.info.classSymbol, sym.hasAnnotation(defn.VolatileAnnot)).typeRef,
+          initFlags = sym.flags &~ Mutable)
         newd.removeAnnotation(defn.VolatileAnnot)
         newd.installAfter(thisTransform)
       }

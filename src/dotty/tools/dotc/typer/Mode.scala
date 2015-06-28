@@ -31,6 +31,12 @@ object Mode {
   val ImplicitsEnabled = newMode(2, "ImplicitsEnabled")
   val InferringReturnType = newMode(3, "InferringReturnType")
 
+  /** This mode bit is set if we collect information without reference to a valid
+   *  context with typerstate and constraint. This is typically done when we
+   *  cache the eligibility of implicits. Caching needs to be done across different constraints.
+   *  Therefore, if TypevarsMissContext is set, subtyping becomes looser, and assumes
+   *  that PolyParams can be sub- and supertypes of anything. See TypeComparer.
+   */
   val TypevarsMissContext = newMode(4, "TypevarsMissContext")
   val CheckCyclic = newMode(5, "CheckCyclic")
 
@@ -50,6 +56,28 @@ object Mode {
 
   /** Allow GADTFlexType labelled types to have their bounds adjusted */
   val GADTflexible = newMode(8, "GADTflexible")
+
+  /** Allow dependent functions. This is currently necessary for unpickling, because
+   *  some dependent functions are passed through from the front end(s?), even though they
+   *  are technically speaking illegal.
+   */
+  val AllowDependentFunctions = newMode(9, "AllowDependentFunctions")
+
+  /** We are currently printing something: avoid to produce more logs about
+   *  the printing
+   */
+  val Printing = newMode(10, "Printing")
+
+  /** We are currently typechecking an ident to determine whether some implicit
+   *  is shadowed - don't do any other shadowing tests.
+   */
+  val ImplicitShadowing = newMode(11, "ImplicitShadowing")
+
+  /** We are currently in a `viewExists` check. In that case, ambiguous
+   *  implicits checks are disabled and we succeed with the first implicit
+   *  found.
+   */
+  val ImplicitExploration = newMode(12, "ImplicitExploration")
 
   val PatternOrType = Pattern | Type
 }

@@ -39,6 +39,7 @@ class ScalaSettings extends Settings.SettingGroup {
   val defines = PrefixSetting("-Dproperty=value", "-D", "Pass -Dproperty=value directly to the runtime system.")
   val toolcp = PathSetting("-toolcp", "Add to the runner classpath.", "")
   val nobootcp = BooleanSetting("-nobootcp", "Do not use the boot classpath for the scala jars.")
+  val strict = BooleanSetting("-strict", "Use strict type rules, which means some formerly legal code does not typecheck anymore.")
 
   val argfiles = BooleanSetting("@<file>", "A text file containing compiler arguments (options and source files)")
   val classpath = PathSetting("-classpath", "Specify where to find user class files.", defaultClasspath) withAbbreviation "-cp"
@@ -87,6 +88,7 @@ class ScalaSettings extends Settings.SettingGroup {
   val Xshowobj = StringSetting("-Xshow-object", "object", "Show internal representation of object.", "")
   val showPhases = BooleanSetting("-Xshow-phases", "Print a synopsis of compiler phases.")
   val sourceReader = StringSetting("-Xsource-reader", "classname", "Specify a custom method for reading source files.", "")
+  val XnoValueClasses = BooleanSetting("-Xno-value-classes", "Do not use value classes. Helps debugging.")
 
   val XoldPatmat = BooleanSetting("-Xoldpatmat", "Use the pre-2.10 pattern matcher. Otherwise, the 'virtualizing' pattern matcher is used in 2.10.")
   val XnoPatmatAnalysis = BooleanSetting("-Xno-patmat-analysis", "Don't perform exhaustivity/unreachability analysis. Also, ignore @switch annotation.")
@@ -120,7 +122,7 @@ class ScalaSettings extends Settings.SettingGroup {
   val log = PhasesSetting("-Ylog", "Log operations during")
   val Ylogcp = BooleanSetting("-Ylog-classpath", "Output information about what classpath is being applied.")
   val Ynogenericsig = BooleanSetting("-Yno-generic-signatures", "Suppress generation of generic signatures for Java.")
-  val noimports = BooleanSetting("-Yno-imports", "Compile without importing scala.*, java.lang.*, or Predef.")
+  val YnoImports = BooleanSetting("-Yno-imports", "Compile without importing scala.*, java.lang.*, or Predef.")
   val nopredef = BooleanSetting("-Yno-predef", "Compile without importing Predef.")
   val noAdaptedArgs = BooleanSetting("-Yno-adapted-args", "Do not adapt an argument list (either by inserting () or creating a tuple) to match the receiver.")
   val selfInAnnots = BooleanSetting("-Yself-in-annots", "Include a \"self\" identifier inside of annotations.")
@@ -149,6 +151,7 @@ class ScalaSettings extends Settings.SettingGroup {
   val Yprintpos = BooleanSetting("-Yprintpos", "show tree positions.")
   val YnoDeepSubtypes = BooleanSetting("-Yno-deep-subtypes", "throw an exception on deep subtyping call stacks.")
   val YprintSyms = BooleanSetting("-Yprint-syms", "when printing trees print info in symbols instead of corresponding info in trees.")
+  val YtestPickler = BooleanSetting("-Ytest-pickler", "self-test for pickling functionality; should be used with -Ystop-after:pickler")
   def stop = YstopAfter
 
   /** Area-specific debug output.
@@ -167,8 +170,8 @@ class ScalaSettings extends Settings.SettingGroup {
   val Yrepldebug = BooleanSetting("-Yrepl-debug", "Trace all repl activity.")
   val Ytyperdebug = BooleanSetting("-Ytyper-debug", "Trace all type assignments.")
   val Ypatmatdebug = BooleanSetting("-Ypatmat-debug", "Trace pattern matching translation.")
-  val Yexplainlowlevel = BooleanSetting("-Yexplainlowlevel", "When explaining type errors, show types at a lower level.")
-  val YnoDoubleBindings = BooleanSetting("-YnoDoubleBindings", "Assert no namedtype is bound twice (should be enabled only if program is error-free).")
+  val Yexplainlowlevel = BooleanSetting("-Yexplain-lowlevel", "When explaining type errors, show types at a lower level.")
+  val YnoDoubleBindings = BooleanSetting("-Yno-double-bindings", "Assert no namedtype is bound twice (should be enabled only if program is error-free).")
 
   val optimise = BooleanSetting("-optimise", "Generates faster bytecode by applying optimisations to the program") withAbbreviation "-optimize"
 

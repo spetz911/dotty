@@ -25,7 +25,7 @@ object CompilerCommand extends DotClass {
     |  example: -Xprint:front,mixin prints the frontend and mixin phases.
     |  example: -Ylog:erasure+ logs the erasure phase and the phase after the erasure phase.
     |           This is useful because during the tree transform of phase X, we often
-    |           already are in phase X+1.
+    |           already are in phase X + 1.
   """.stripMargin.trim + "\n"
 
   def shortUsage = s"Usage: $cmdName <options> <source files>"
@@ -110,19 +110,19 @@ object CompilerCommand extends DotClass {
 
     if (summary.errors.nonEmpty) {
       summary.errors foreach (ctx.error(_))
-      ctx.echo("  dotc -help  gives more information")
+      ctx.println("  dotc -help  gives more information")
       Nil
     }
     else if (settings.version.value) {
-      ctx.echo(versionMsg)
+      ctx.println(versionMsg)
       Nil
     }
     else if (shouldStopWithInfo) {
-      ctx.echo(infoMessage)
+      ctx.println(infoMessage)
       Nil
     } else {
       if (summary.arguments.isEmpty && !settings.resident.value)
-        ctx.echo(usageMessage)
+        ctx.println(usageMessage)
       summary.arguments
     }
   }

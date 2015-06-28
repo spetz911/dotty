@@ -13,8 +13,6 @@ import dotty.tools.dotc.transform.SymUtils._
  *  @param  typeMap  A function from Type to Type that gets applied to the
  *                   type of every tree node and to all locally defined symbols,
  *                   followed by the substitution [substFrom := substTo].
- *  @param ownerMap  A function that translates owners of top-level local symbols
- *                   defined in the mapped tree.
  *  @param treeMap   A transformer that translates all encountered subtrees in
  *                   prefix traversal orders
  *  @param oldOwners Previous owners. If a top-level local symbol in the mapped tree
@@ -27,10 +25,10 @@ import dotty.tools.dotc.transform.SymUtils._
  *  The reason the substitution is broken out from the rest of the type map is
  *  that all symbols have to be substituted at the same time. If we do not do this,
  *  we risk data races on named types. Example: Say we have `outer#1.inner#2` and we
- *  have two substitutons S1 = [outer#1 := outer#3], S2 = [inner#2 := inner#4] where
+ *  have two substitutions S1 = [outer#1 := outer#3], S2 = [inner#2 := inner#4] where
  *  hashtags precede symbol ids. If we do S1 first, we get outer#2.inner#3. If we then
  *  do S2 we get outer#2.inner#4. But that means that the named type outer#2.inner
- *  gets two different denotations in the same period. Hence, if -YnoDoubleBindings is
+ *  gets two different denotations in the same period. Hence, if -Yno-double-bindings is
  *  set, we would get a data race assertion error.
  */
 final class TreeTypeMap(
@@ -78,22 +76,22 @@ final class TreeTypeMap(
     }
 
   override def transform(tree: tpd.Tree)(implicit ctx: Context): tpd.Tree = treeMap(tree) match {
-    case impl @ Template(constr, parents, self, body) =>
+    case impl @ Template(constr, parents, self, _) =>
       val tmap = withMappedSyms(localSyms(impl :: self :: Nil))
       cpy.Template(impl)(
           constr = tmap.transformSub(constr),
           parents = parents mapconserve transform,
           self = tmap.transformSub(self),
-          body = body mapconserve tmap.transform
+          body = impl.body mapconserve tmap.transform
         ).withType(tmap.mapType(impl.tpe))
     case tree1 =>
       tree1.withType(mapType(tree1.tpe)) match {
         case id: Ident if tpd.needsSelect(id.tpe) =>
           ref(id.tpe.asInstanceOf[TermRef]).withPos(id.pos)
-        case ddef @ DefDef(name, tparams, vparamss, tpt, rhs) =>
+        case ddef @ DefDef(name, tparams, vparamss, tpt, _) =>
           val (tmap1, tparams1) = transformDefs(ddef.tparams)
           val (tmap2, vparamss1) = tmap1.transformVParamss(vparamss)
-          cpy.DefDef(ddef)(name, tparams1, vparamss1, tmap2.transform(tpt), tmap2.transform(rhs))
+          cpy.DefDef(ddef)(name, tparams1, vparamss1, tmap2.transform(tpt), tmap2.transform(ddef.rhs))
         case blk @ Block(stats, expr) =>
           val (tmap1, stats1) = transformDefs(stats)
           val expr1 = tmap1.transform(expr)

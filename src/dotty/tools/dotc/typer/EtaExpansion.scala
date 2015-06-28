@@ -34,8 +34,11 @@ object EtaExpansion {
    *     lhs += expr
    */
   def liftAssigned(defs: mutable.ListBuffer[Tree], tree: Tree)(implicit ctx: Context): Tree = tree match {
-    case Apply(fn @ Select(pre, name), args) =>
-      cpy.Apply(tree)(cpy.Select(fn)(lift(defs, pre), name), liftArgs(defs, fn.tpe, args))
+    case Apply(MaybePoly(fn @ Select(pre, name), targs), args) =>
+      cpy.Apply(tree)(
+        cpy.Select(fn)(
+          lift(defs, pre), name).appliedToTypeTrees(targs),
+          liftArgs(defs, fn.tpe, args))
     case Select(pre, name) =>
       cpy.Select(tree)(lift(defs, pre), name)
     case _ =>
@@ -54,8 +57,8 @@ object EtaExpansion {
   /** Lift arguments that are not-idempotent into ValDefs in buffer `defs`
    *  and replace by the idents of so created ValDefs.
    */
-  def liftArgs(defs: mutable.ListBuffer[Tree], methType: Type, args: List[Tree])(implicit ctx: Context) =
-    methType match {
+  def liftArgs(defs: mutable.ListBuffer[Tree], methRef: Type, args: List[Tree])(implicit ctx: Context) =
+    methRef.widen match {
       case MethodType(paramNames, paramTypes) =>
         (args, paramNames, paramTypes).zipped map { (arg, name, tp) =>
           if (tp.isInstanceOf[ExprType]) arg

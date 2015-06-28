@@ -8,8 +8,12 @@ import Symbols._
 import Scopes._
 import collection.mutable
 import TreeTransforms.MiniPhaseTransform
+import SymDenotations._
 import ast.Trees._
+import NameOps._
+import typer.Mode
 import TreeTransforms.TransformerInfo
+import StdNames._
 
 /** The preceding lambda lift and flatten phases move symbols to different scopes
  *  and rename them. This miniphase cleans up afterwards and makes sure that all
@@ -20,12 +24,31 @@ class RestoreScopes extends MiniPhaseTransform with IdentityDenotTransformer { t
   override def phaseName = "restoreScopes"
 
   override def transformTypeDef(tree: TypeDef)(implicit ctx: Context, info: TransformerInfo) = {
-    val TypeDef(_, Template(constr, _, _, body)) = tree
+    val TypeDef(_, impl: Template) = tree
+    //
     val restoredDecls = newScope
-    for (stat <- constr :: body)
+    for (stat <- impl.constr :: impl.body)
       if (stat.isInstanceOf[MemberDef] && stat.symbol.exists)
         restoredDecls.enter(stat.symbol)
-    val cinfo = tree.symbol.asClass.classInfo
+      // Enter class in enclosing package scope, in case it was an inner class before flatten.
+      // For top-level classes this does nothing.
+    val cls = tree.symbol.asClass
+    val pkg = cls.owner.asClass
+
+    // Bring back companion links
+    val companionClass  = cls.info.decls.lookup(nme.COMPANION_CLASS_METHOD)
+    val companionModule = cls.info.decls.lookup(nme.COMPANION_MODULE_METHOD)
+
+    if (companionClass.exists) {
+      restoredDecls.enter(companionClass)
+    }
+
+    if (companionModule.exists) {
+      restoredDecls.enter(companionModule)
+    }
+
+    pkg.enter(cls)
+    val cinfo = cls.classInfo
     tree.symbol.copySymDenotation(
       info = cinfo.derivedClassInfo( // Dotty deviation: Cannot expand cinfo inline without a type error
         decls = restoredDecls: Scope)).installAfter(thisTransform)

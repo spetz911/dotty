@@ -32,7 +32,7 @@ import collection.mutable
 object Implicits {
 
   /** A common base class of contextual implicits and of-type implicits which
-   *  represents as set of implicit references.
+   *  represents a set of implicit references.
    */
   abstract class ImplicitRefs(initctx: Context) {
     implicit val ctx: Context =
@@ -90,7 +90,7 @@ object Implicits {
       }
 
       if (refs.isEmpty) refs
-      else refs filter (refMatches(_)(ctx.fresh.setExploreTyperState.addMode(Mode.TypevarsMissContext))) // create a defensive copy of ctx to avoid constraint pollution
+      else refs filter (refMatches(_)(ctx.fresh.addMode(Mode.TypevarsMissContext).setExploreTyperState)) // create a defensive copy of ctx to avoid constraint pollution
     }
   }
 
@@ -186,7 +186,7 @@ object Implicits {
   abstract class SearchResult
 
   /** A successful search
-   *  @param ref   The implicit reference that succeeeded
+   *  @param ref   The implicit reference that succeeded
    *  @param tree  The typed tree that can needs to be inserted
    *  @param ctx   The context after the implicit search
    */
@@ -299,7 +299,7 @@ trait ImplicitRunInfo { self: RunInfo =>
       }
 
     // todo: compute implicits directly, without going via companionRefs?
-    def collectCompanions(tp: Type): TermRefSet = track("computeImplicicScope") {
+    def collectCompanions(tp: Type): TermRefSet = track("computeImplicitScope") {
       ctx.traceIndented(i"collectCompanions($tp)", implicits) {
         val comps = new TermRefSet
         tp match {
@@ -337,25 +337,29 @@ trait ImplicitRunInfo { self: RunInfo =>
    /** The implicit scope of type `tp`
      *  @param isLifted    Type `tp` is the result of a `liftToClasses` application
      */
-    def iscope(tp: Type, isLifted: Boolean = false): OfTypeImplicits =
+    def iscope(tp: Type, isLifted: Boolean = false): OfTypeImplicits = {
+      def computeIScope(cacheResult: Boolean) = {
+        val savedEphemeral = ctx.typerState.ephemeral
+        ctx.typerState.ephemeral = false
+        try {
+          val liftedTp = if (isLifted) tp else liftToClasses(tp)
+          val result =
+            if (liftedTp ne tp) iscope(liftedTp, isLifted = true)
+            else ofTypeImplicits(collectCompanions(tp))
+          if (ctx.typerState.ephemeral) record("ephemeral cache miss: implicitScope")
+          else if (cacheResult) implicitScopeCache(tp) = result
+          result
+        }
+        finally ctx.typerState.ephemeral |= savedEphemeral
+      }
+
       if (tp.hash == NotCached || !Config.cacheImplicitScopes)
-        ofTypeImplicits(collectCompanions(tp))
+        computeIScope(cacheResult = false)
       else implicitScopeCache get tp match {
         case Some(is) => is
-        case None =>
-          val savedEphemeral = ctx.typerState.ephemeral
-          ctx.typerState.ephemeral = false
-          try {
-            val liftedTp = if (isLifted) tp else liftToClasses(tp)
-            val result =
-              if (liftedTp ne tp) iscope(liftedTp, isLifted = true)
-              else ofTypeImplicits(collectCompanions(tp))
-            if (ctx.typerState.ephemeral) record("ephemeral cache miss: implicitScope")
-            else implicitScopeCache(tp) = result
-            result
-          }
-          finally ctx.typerState.ephemeral |= savedEphemeral
-        }
+        case None => computeIScope(cacheResult = true)
+      }
+    }
 
     iscope(tp)
   }
@@ -376,22 +380,14 @@ trait Implicits { self: Typer =>
   override def viewExists(from: Type, to: Type)(implicit ctx: Context): Boolean = (
        !from.isError
     && !to.isError
+    && !ctx.isAfterTyper
     && (ctx.mode is Mode.ImplicitsEnabled)
-    && { from.widenExpr match {
-           case from: TypeRef if defn.ScalaValueClasses contains from.symbol =>
-             to.widenExpr match {
-               case to: TypeRef if defn.ScalaValueClasses contains to.symbol =>
-                 util.Stats.record("isValueSubClass")
-                 return defn.isValueSubClass(from.symbol, to.symbol)
-               case _ =>
-             }
-           case from: ValueType =>
-             ;
-           case _ =>
-             return false
-         }
-         inferView(dummyTreeOfType(from), to)(ctx.fresh.setExploreTyperState).isInstanceOf[SearchSuccess]
-       }
+    && from.isInstanceOf[ValueType]
+    && (  from.isValueSubType(to)
+       || inferView(dummyTreeOfType(from), to)
+            (ctx.fresh.addMode(Mode.ImplicitExploration).setExploreTyperState)
+            .isInstanceOf[SearchSuccess]
+       )
     )
 
   /** Find an implicit conversion to apply to given tree `from` so that the
@@ -451,6 +447,7 @@ trait Implicits { self: Typer =>
 
     private def implicitProto(resultType: Type, f: Type => Type) =
       if (argument.isEmpty) f(resultType) else ViewProto(f(argument.tpe.widen), f(resultType))
+        // Not clear whether we need to drop the `.widen` here. All tests pass with it in place, though.
 
     assert(argument.isEmpty || argument.tpe.isValueType || argument.tpe.isInstanceOf[ExprType],
         d"found: ${argument.tpe}, expected: $pt")
@@ -485,7 +482,8 @@ trait Implicits { self: Typer =>
             pt)
         val generated1 = adapt(generated, pt)
         lazy val shadowing =
-          typed(untpd.Ident(ref.name) withPos pos.toSynthetic, funProto)(nestedContext.setNewTyperState)
+          typed(untpd.Ident(ref.name) withPos pos.toSynthetic, funProto)
+               (nestedContext.addMode(Mode.ImplicitShadowing).setNewTyperState)
         def refMatches(shadowing: Tree): Boolean =
           ref.symbol == closureBody(shadowing).symbol || {
             shadowing match {
@@ -495,8 +493,9 @@ trait Implicits { self: Typer =>
           }
         if (ctx.typerState.reporter.hasErrors)
           nonMatchingImplicit(ref)
-        else if (contextual && !shadowing.tpe.isError && !refMatches(shadowing)) {
-          implicits.println(i"SHADOWING $ref is shadowed by $shadowing")
+        else if (contextual && !ctx.mode.is(Mode.ImplicitShadowing) &&
+                 !shadowing.tpe.isError && !refMatches(shadowing)) {
+          implicits.println(i"SHADOWING $ref in ${ref.termSymbol.owner} is shadowed by $shadowing in ${shadowing.symbol.owner}")
           shadowedImplicit(ref, methPart(shadowing).tpe)
         }
         else
@@ -518,8 +517,11 @@ trait Implicits { self: Typer =>
             case fail: SearchFailure =>
               rankImplicits(pending1, acc)
             case best: SearchSuccess =>
-              val newPending = pending1 filter (isAsGood(_, best.ref)(nestedContext.setExploreTyperState))
-              rankImplicits(newPending, best :: acc)
+              if (ctx.mode.is(Mode.ImplicitExploration)) best :: Nil
+              else {
+                val newPending = pending1 filter (isAsGood(_, best.ref)(nestedContext.setExploreTyperState))
+                rankImplicits(newPending, best :: acc)
+              }
           }
         case nil => acc
       }

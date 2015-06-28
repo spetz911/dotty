@@ -287,7 +287,7 @@ object Flags {
   /** A trait that has only abstract methods as members
    *  (and therefore can be represented by a Java interface
    */
-  final val PureInterface = typeFlag(22, "interface")
+  final val PureInterface = typeFlag(22, "interface") // TODO when unpickling, reconstitute from context
 
   /** Labeled with of abstract & override */
   final val AbsOverride = termFlag(22, "abstract override")
@@ -318,8 +318,8 @@ object Flags {
   /** A method that has default params */
   final val DefaultParameterized = termFlag(27, "<defaultparam>")
 
-  /** Symbol is initialized to the default value, e.g. var x: T = _ */
-  final val DefaultInit = termFlag(28, "<defaultinit>")
+  /** A type that is defined by a type bind */
+  final val BindDefinedType = typeFlag(27, "<bind-defined>")
 
   /** Symbol is inlined */
   final val Inline = commonFlag(29, "inline")
@@ -332,7 +332,7 @@ object Flags {
   final val JavaStaticTerm = JavaStatic.toTermFlags
   final val JavaStaticType = JavaStatic.toTypeFlags
 
-  /** Trait is not an interface, but does not have fields or intialization code */
+  /** Trait does not have fields or initialization code */
   final val NoInits = typeFlag(32, "<noInits>")
 
   /** Variable is accessed from nested function. */
@@ -345,7 +345,7 @@ object Flags {
   final val Bridge = termFlag(34, "<bridge>")
 
   /** Symbol is a Java varargs bridge */ // (needed?)
-  final val VBridge = termFlag(35, "<vbridge>")
+  final val VBridge = termFlag(35, "<vbridge>") // TODO remove
 
   /** Symbol is a method which should be marked ACC_SYNCHRONIZED */
   final val Synchronized = termFlag(36, "<synchronized>")
@@ -366,9 +366,6 @@ object Flags {
 
   /** Symbol is defined in a super call */
   final val InSuperCall = commonFlag(46, "<in supercall>")
-
-  /** Symbol with private access is accessed outside its private scope */
-  final val NotJavaPrivate = commonFlag(47, "<not-java-private>")
 
   /** Denotation is in train of being loaded and completed, used to catch cyclic dependencies */
   final val Touched = commonFlag(48, "<touched>")
@@ -430,7 +427,7 @@ object Flags {
 
   /** Flags representing modifiers that can appear in trees */
   final val ModifierFlags =
-    SourceModifierFlags | Module | Param | Synthetic | Package | Local
+    SourceModifierFlags | Module | Param | Synthetic | Package | Local | commonFlags(Mutable)
       // | Trait is subsumed by commonFlags(Lazy) from SourceModifierFlags
 
   assert(ModifierFlags.isTermFlags && ModifierFlags.isTypeFlags)
@@ -470,6 +467,8 @@ object Flags {
   /** Pure interfaces always have these flags */
   final val PureInterfaceCreationFlags = Trait | NoInits | PureInterface
 
+  final val NoInitsInterface = NoInits | PureInterface
+
   /** The flags of the self symbol */
   final val SelfSymFlags = Private | Local | Deferred
 
@@ -500,6 +499,8 @@ object Flags {
   /** These flags are pickled */
   final val PickledFlags = flagRange(FirstFlag, FirstNotPickledFlag)
 
+  final val AllFlags = flagRange(FirstFlag, MaxFlag)
+
   /** An abstract class or a trait */
   final val AbstractOrTrait = Abstract | Trait
 
@@ -521,14 +522,23 @@ object Flags {
   /** A private method */
   final val PrivateMethod = allOf(Private, Method)
 
+  /** A private accessor */
+  final val PrivateAccessor = allOf(Private, Accessor)
+
   /** A type parameter with synthesized name */
   final val ExpandedTypeParam = allOf(ExpandedName, TypeParam)
 
   /** A parameter or parameter accessor */
   final val ParamOrAccessor = Param | ParamAccessor
 
+  /** A lazy or deferred value */
+  final val LazyOrDeferred = Lazy | Deferred
+
   /** A type parameter or type parameter accessor */
   final val TypeParamOrAccessor = TypeParam | TypeParamAccessor
+
+  /** If symbol of a type alias has these flags, prefer the alias */
+  final val AliasPreferred = TypeParam | TypeArgument | ExpandedName
 
   /** A covariant type parameter instance */
   final val LocalCovariant = allOf(Local, Covariant)
@@ -551,7 +561,7 @@ object Flags {
   /** A Java interface, potentially with default methods */
   final val JavaTrait = allOf(JavaDefined, Trait, NoInits)
 
-    /** A Java interface */
+    /** A Java interface */ // TODO when unpickling, reconstitute from context
   final val JavaInterface = allOf(JavaDefined, Trait)
 
   /** A Java companion object */

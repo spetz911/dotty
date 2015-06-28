@@ -17,6 +17,7 @@ import Types._
 import Decorators._
 import DenotTransformers._
 import util.Positions._
+import Constants.Constant
 import collection.mutable
 
 /** This transform
@@ -29,14 +30,29 @@ class Constructors extends MiniPhaseTransform with SymTransformer { thisTransfor
   import tpd._
 
   override def phaseName: String = "constructors"
-  override def runsAfter: Set[Class[_ <: Phase]] = Set(classOf[Erasure])
+  override def runsAfter: Set[Class[_ <: Phase]] = Set(classOf[Memoize])
+
+
+  /** All initializers for non-lazy fields should be moved into constructor.
+   *  All non-abstract methods should be implemented (this is assured for constructors
+   *  in this phase and for other methods in memoize).
+   */
+  override def checkPostCondition(tree: tpd.Tree)(implicit ctx: Context): Unit = {
+    tree match {
+      case tree: ValDef if tree.symbol.exists && tree.symbol.owner.isClass && !tree.symbol.is(Lazy) =>
+        assert(tree.rhs.isEmpty, i"$tree: initializer should be moved to constructors")
+      case tree: DefDef if !tree.symbol.is(LazyOrDeferred) =>
+        assert(!tree.rhs.isEmpty, i"unimplemented: $tree")
+      case _ =>
+    }
+  }
 
   /** Symbols that are owned by either <local dummy> or a class field move into the
    *  primary constructor.
    */
   override def transformSym(sym: SymDenotation)(implicit ctx: Context): SymDenotation = {
     def ownerBecomesConstructor(owner: Symbol): Boolean =
-      (owner.isLocalDummy || owner.isTerm && !owner.is(Method | Lazy)) &&
+      (owner.isLocalDummy || owner.isTerm && !owner.is(MethodOrLazy)) &&
       owner.owner.isClass
     if (ownerBecomesConstructor(sym.owner))
       sym.copySymDenotation(owner = sym.owner.enclosingClass.primaryConstructor)
@@ -53,9 +69,8 @@ class Constructors extends MiniPhaseTransform with SymTransformer { thisTransfor
    *  constructor.
    */
   private def mightBeDropped(sym: Symbol)(implicit ctx: Context) =
-    sym.is(Private, butNot = KeeperFlags) && !sym.is(MutableParamAccessor)
+    sym.is(Private, butNot = MethodOrLazy) && !sym.is(MutableParamAccessor)
 
-  private final val KeeperFlags = Method | Lazy | NotJavaPrivate
   private final val MutableParamAccessor = allOf(Mutable, ParamAccessor)
 
   override def transformTemplate(tree: Template)(implicit ctx: Context, info: TransformerInfo): Tree = {
@@ -64,20 +79,13 @@ class Constructors extends MiniPhaseTransform with SymTransformer { thisTransfor
 
     // Produce aligned accessors and constructor parameters. We have to adjust
     // for any outer parameters, which are last in the sequence of original
-    // parameter accessors but should come first in the constructor parameter list.
-    var accessors = cls.paramAccessors.filterNot(_.isSetter)
-    var vparamsWithOuter = vparams
-    if (!accessors.hasSameLengthAs(vparams)) {
-      accessors.reverse match {
-        case last :: _ if (last.name == nme.OUTER) =>
-          accessors = last :: accessors.init // align wth calling convention
-          vparamsWithOuter = ValDef(last.asTerm) :: vparams
-        case _ =>
-      }
-      assert(accessors.hasSameLengthAs(vparamsWithOuter),
-        i"lengths differ for $cls, param accs = $accessors, params = ($vparamsWithOuter%, %)")
+    // parameter accessors but come first in the constructor parameter list.
+    val accessors = cls.paramAccessors.filterNot(_.isSetter)
+    val vparamsWithOuterLast = vparams match {
+      case vparam :: rest if vparam.name == nme.OUTER => rest ::: vparam :: Nil
+      case _ => vparams
     }
-    val paramSyms = vparamsWithOuter map (_.symbol)
+    val paramSyms = vparamsWithOuterLast map (_.symbol)
 
     // Adjustments performed when moving code into the constructor:
     //  (1) Replace references to param accessors by constructor parameters
@@ -86,11 +94,10 @@ class Constructors extends MiniPhaseTransform with SymTransformer { thisTransfor
     //  (2) If the parameter accessor reference was to an alias getter,
     //      drop the () when replacing by the parameter.
     object intoConstr extends TreeMap {
-      private var excluded: FlagSet = _
       override def transform(tree: Tree)(implicit ctx: Context): Tree = tree match {
         case Ident(_) | Select(This(_), _) =>
           var sym = tree.symbol
-          if (sym is (ParamAccessor, butNot = excluded)) sym = sym.subst(accessors, paramSyms)
+          if (sym is (ParamAccessor, butNot = Mutable)) sym = sym.subst(accessors, paramSyms)
           if (sym.owner.isConstructor) ref(sym).withPos(tree.pos) else tree
         case Apply(fn, Nil) =>
           val fn1 = transform(fn)
@@ -101,9 +108,8 @@ class Constructors extends MiniPhaseTransform with SymTransformer { thisTransfor
           if (noDirectRefsFrom(tree)) tree else super.transform(tree)
       }
 
-      def apply(tree: Tree, inSuperCall: Boolean = false)(implicit ctx: Context): Tree = {
-        this.excluded = if (inSuperCall) EmptyFlags else Mutable
-        transform(tree)
+      def apply(tree: Tree, prevOwner: Symbol)(implicit ctx: Context): Tree = {
+        transform(tree).changeOwnerAfter(prevOwner, constr.symbol, thisTransform)
       }
     }
 
@@ -120,7 +126,7 @@ class Constructors extends MiniPhaseTransform with SymTransformer { thisTransfor
       private val seen = mutable.Set[Symbol](accessors: _*)
       val retained = mutable.Set[Symbol]()
       def dropped: collection.Set[Symbol] = seen -- retained
-      override def traverse(tree: Tree) = {
+      override def traverse(tree: Tree)(implicit ctx: Context) = {
         val sym = tree.symbol
         tree match {
           case Ident(_) | Select(This(_), _) if inConstr && seen(tree.symbol) =>
@@ -150,28 +156,44 @@ class Constructors extends MiniPhaseTransform with SymTransformer { thisTransfor
 
     val constrStats, clsStats = new mutable.ListBuffer[Tree]
 
+    /** Map outer getters $outer and outer accessors $A$B$$$outer to the given outer parameter. */
+    def mapOuter(outerParam: Symbol) = new TreeMap {
+      override def transform(tree: Tree)(implicit ctx: Context) = tree match {
+        case Apply(fn, Nil)
+          if (fn.symbol.is(OuterAccessor)
+             || fn.symbol.isGetter && fn.symbol.name == nme.OUTER
+             ) &&
+             fn.symbol.info.resultType.classSymbol == outerParam.info.classSymbol =>
+          ref(outerParam)
+        case _ =>
+          super.transform(tree)
+      }
+    }
+
     // Split class body into statements that go into constructor and
     // definitions that are kept as members of the class.
     def splitStats(stats: List[Tree]): Unit = stats match {
       case stat :: stats1 =>
         stat match {
-          case stat @ ValDef(name, tpt, rhs) if !stat.symbol.is(Lazy) =>
+          case stat @ ValDef(name, tpt, _) if !stat.symbol.is(Lazy) =>
             val sym = stat.symbol
             if (isRetained(sym)) {
-              if (!rhs.isEmpty && !isWildcardArg(rhs))
-                constrStats += Assign(ref(sym), intoConstr(rhs)).withPos(stat.pos)
+              if (!stat.rhs.isEmpty && !isWildcardArg(stat.rhs))
+                constrStats += Assign(ref(sym), intoConstr(stat.rhs, sym)).withPos(stat.pos)
               clsStats += cpy.ValDef(stat)(rhs = EmptyTree)
             }
-            else if (!rhs.isEmpty) {
+            else if (!stat.rhs.isEmpty) {
               sym.copySymDenotation(
                 initFlags = sym.flags &~ Private,
                 owner = constr.symbol).installAfter(thisTransform)
-              constrStats += intoConstr(stat)
+              constrStats += intoConstr(stat, sym)
             }
+          case DefDef(nme.CONSTRUCTOR, _, ((outerParam @ ValDef(nme.OUTER, _, _)) :: _) :: Nil, _, _) =>
+            clsStats += mapOuter(outerParam.symbol).transform(stat)
           case _: DefTree =>
             clsStats += stat
           case _ =>
-            constrStats += intoConstr(stat)
+            constrStats += intoConstr(stat, tree.symbol)
         }
         splitStats(stats1)
       case Nil =>
@@ -179,11 +201,27 @@ class Constructors extends MiniPhaseTransform with SymTransformer { thisTransfor
     }
     splitStats(tree.body)
 
-    val accessorFields = accessors.filterNot(_ is Method)
-
     // The initializers for the retained accessors */
-    val copyParams = accessorFields.filter(isRetained).map(acc =>
-      Assign(ref(acc), ref(acc.subst(accessors, paramSyms))).withPos(tree.pos))
+    val copyParams = accessors flatMap { acc =>
+      if (!isRetained(acc)) Nil
+      else {
+        val target = if (acc.is(Method)) acc.field else acc
+        if (!target.exists) Nil // this case arises when the parameter accessor is an alias
+        else {
+          val param = acc.subst(accessors, paramSyms)
+          val assigns = Assign(ref(target), ref(param)).withPos(tree.pos) :: Nil
+          if (acc.name != nme.OUTER) assigns
+          else {
+            // insert test: if ($outer eq null) throw new NullPointerException
+            val nullTest =
+              If(ref(param).select(defn.Object_eq).appliedTo(Literal(Constant(null))),
+                 Throw(New(defn.NullPointerExceptionClass.typeRef, Nil)),
+                 unitLiteral)
+            nullTest :: assigns
+          }
+        }
+      }
+    }
 
     // Drop accessors that are not retained from class scope
     val dropped = usage.dropped
@@ -199,9 +237,15 @@ class Constructors extends MiniPhaseTransform with SymTransformer { thisTransfor
       case stats => (Nil, stats)
     }
 
+    val mappedSuperCalls = vparams match {
+      case (outerParam @ ValDef(nme.OUTER, _, _)) :: _ =>
+        superCalls.map(mapOuter(outerParam.symbol).transform)
+      case _ => superCalls
+    }
+
     cpy.Template(tree)(
       constr = cpy.DefDef(constr)(
-        rhs = Block(superCalls ::: copyParams ::: followConstrStats, unitLiteral)),
+        rhs = Block(mappedSuperCalls ::: copyParams ::: followConstrStats, unitLiteral)),
       body = clsStats.toList)
   }
 }

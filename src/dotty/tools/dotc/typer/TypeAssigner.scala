@@ -28,9 +28,18 @@ trait TypeAssigner {
     }
   }
 
-  def avoid(tp: Type, syms: => List[Symbol])(implicit ctx: Context): Type = {
+  /** An upper approximation of the given type `tp` that does not refer to any symbol in `symsToAvoid`.
+   *  Approximation steps are:
+   *
+   *   - follow aliases if the original refers to a forbidden symbol
+   *   - widen termrefs that refer to a forbidden symbol
+   *   - replace ClassInfos of forbidden classes by the intersection of their parents, refined by all
+   *     non-private fields, methods, and type members.
+   *   - drop refinements referring to a forbidden symbol.
+   */
+  def avoid(tp: Type, symsToAvoid: => List[Symbol])(implicit ctx: Context): Type = {
     val widenMap = new TypeMap {
-      lazy val forbidden = syms.toSet
+      lazy val forbidden = symsToAvoid.toSet
       def toAvoid(tp: Type): Boolean = tp match {
         case tp: TermRef =>
           val sym = tp.symbol
@@ -38,6 +47,8 @@ trait TypeAssigner {
                sym.owner.isTerm && (forbidden contains sym)
             || !(sym.owner is Package) && toAvoid(tp.prefix)
             )
+        case tp: TypeRef =>
+          forbidden contains tp.symbol
         case _ =>
           false
       }
@@ -48,7 +59,7 @@ trait TypeAssigner {
           tp.info match {
             case TypeAlias(ref) =>
               apply(ref)
-            case info: ClassInfo =>
+            case info: ClassInfo if variance > 0 =>
               val parentType = info.instantiatedParents.reduceLeft(ctx.typeComparer.andType(_, _))
               def addRefinement(parent: Type, decl: Symbol) = {
                 val inherited = parentType.findMember(decl.name, info.cls.thisType, Private)
@@ -64,16 +75,22 @@ trait TypeAssigner {
                 sym => sym.is(TypeParamAccessor | Private) || sym.isConstructor)
               val fullType = (parentType /: refinableDecls)(addRefinement)
               mapOver(fullType)
+            case TypeBounds(lo, hi) if variance > 0 =>
+              apply(hi)
             case _ =>
               mapOver(tp)
           }
         case tp: RefinedType =>
           val tp1 @ RefinedType(parent1, _) = mapOver(tp)
-          if (tp1.refinedInfo existsPart toAvoid) {
+          if (tp1.refinedInfo.existsPart(toAvoid) && variance > 0) {
             typr.println(s"dropping refinement from $tp1")
             parent1
           }
           else tp1
+        case tp: TypeVar if ctx.typerState.constraint.contains(tp) =>
+          val lo = ctx.typerState.constraint.fullLowerBound(tp.origin)
+          val lo1 = avoid(lo, symsToAvoid)
+          if (lo1 ne lo) lo1 else tp
         case _ =>
           mapOver(tp)
       }
@@ -118,7 +135,7 @@ trait TypeAssigner {
         val name = tpe.name
         val d = tpe.denot.accessibleFrom(pre, superAccess)
         if (!d.exists) {
-          // it could be that we found an inaccessbile private member, but there is
+          // it could be that we found an inaccessible private member, but there is
           // an inherited non-private member with the same name and signature.
           val d2 = pre.nonPrivateMember(name)
           if (reallyExists(d2) && firstTry)
@@ -193,7 +210,13 @@ trait TypeAssigner {
       case p.arrayApply => MethodType(defn.IntType :: Nil, arrayElemType)
       case p.arrayUpdate => MethodType(defn.IntType :: arrayElemType :: Nil, defn.UnitType)
       case p.arrayLength => MethodType(Nil, defn.IntType)
-      case nme.clone_ if qualType.isInstanceOf[JavaArrayType] => MethodType(Nil, qualType)
+
+      // Note that we do not need to handle calls to Array[T]#clone() specially:
+      // The JLS section 10.7 says "The return type of the clone method of an array type
+      // T[] is T[]", but the actual return type at the bytecode level is Object which
+      // is casted to T[] by javac. Since the return type of Array[T]#clone() is Array[T],
+      // this is exactly what Erasure will do.
+
       case _ => accessibleSelectionType(tree, qual)
     }
     tree.withType(tp)
@@ -303,9 +326,6 @@ trait TypeAssigner {
     if (cases.isEmpty) tree.withType(expr.tpe)
     else tree.withType(ctx.typeComparer.lub(expr.tpe :: cases.tpes))
   }
-
-  def assignType(tree: untpd.Throw)(implicit ctx: Context) =
-    tree.withType(defn.NothingType)
 
   def assignType(tree: untpd.SeqLiteral, elems: List[Tree])(implicit ctx: Context) = tree match {
     case tree: JavaSeqLiteral =>

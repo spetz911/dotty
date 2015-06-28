@@ -7,8 +7,8 @@ import Periods._
 import Symbols._
 import Scopes._
 import typer.{FrontEnd, Typer, Mode, ImportInfo, RefChecks}
-import reporting.ConsoleReporter
-import dotty.tools.dotc.core.Phases.Phase
+import reporting.{ConsoleReporter, Reporter}
+import Phases.Phase
 import dotty.tools.dotc.transform._
 import dotty.tools.dotc.transform.TreeTransforms.{TreeTransform, TreeTransformer}
 import dotty.tools.dotc.core.DenotTransformers.DenotTransformer
@@ -38,33 +38,46 @@ class Compiler {
   def phases: List[List[Phase]] =
     List(
       List(new FrontEnd),
-      List(new FirstTransform,
-           new SyntheticMethods),
-      List(new SuperAccessors),
-      // pickling goes here
+      List(new PostTyper),
+      List(new Pickler),
+      List(new FirstTransform),
       List(new RefChecks,
            new ElimRepeated,
-           new ElimLocals,
+           new NormalizeFlags,
            new ExtensionMethods,
-           new TailRec),
+           new ExpandSAMs,
+           new TailRec,
+           new ClassOf),
       List(new PatternMatcher,
            new ExplicitOuter,
            new Splitter),
-      List(new ElimByName,
-           new SeqLiterals,
+      List(new SeqLiterals,
            new InterceptedMethods,
            new Literalize,
            new Getters,
+           new ClassTags,
+           new ElimByName,
+           new AugmentScala2Traits,
            new ResolveSuper),
       List(new Erasure),
-      List(new Mixin,
-           new Memoize, // TODO: Make LazyVals a part of this phase
-           new CapturedVars,
-           new Constructors),
-      List(new LambdaLift,
+      List(new ElimErasedValueType,
+           new VCInline,
+           new Mixin,
+           new LazyVals,
+           new Memoize,
+           new LinkScala2ImplClasses,
+           new CapturedVars, // capturedVars has a transformUnit: no phases should introduce local mutable vars here
+           new Constructors,
+           new FunctionalInterfaces),
+      List(new LambdaLift,   // in this mini-phase block scopes are incorrect. No phases that rely on scopes should be here
+           new ElimStaticThis,
            new Flatten,
            new RestoreScopes),
-      List(/*new PrivateToStatic,*/ new CollectEntryPoints, new LabelDefs),
+      List(/*new PrivateToStatic,*/
+           new ExpandPrivate,
+           new CollectEntryPoints,
+           new LabelDefs,
+           new TraitConstructors),
       List(new GenBCode)
     )
 
@@ -81,9 +94,9 @@ class Compiler {
    *                 for type checking.
    *    imports      For each element of RootImports, an import context
    */
-  def rootContext(implicit ctx: Context): Context = {
+  def rootContext(implicit ctx: Context, r: Option[Reporter] = None): Context = {
     ctx.definitions.init(ctx)
-    ctx.usePhases(phases)
+    ctx.setPhasePlan(phases)
     val rootScope = new MutableScope
     val bootstrap = ctx.fresh
       .setPeriod(Period(nextRunId, FirstPhaseId))
@@ -93,18 +106,20 @@ class Compiler {
       .setOwner(defn.RootClass)
       .setTyper(new Typer)
       .setMode(Mode.ImplicitsEnabled)
-      .setTyperState(new MutableTyperState(ctx.typerState, new ConsoleReporter()(ctx), isCommittable = true))
+      .setTyperState(new MutableTyperState(ctx.typerState, r.getOrElse(new ConsoleReporter()(ctx)), isCommittable = true))
     ctx.definitions.init(start) // set context of definitions to start
-    def addImport(ctx: Context, sym: Symbol) =
-      ctx.fresh.setImportInfo(ImportInfo.rootImport(sym)(ctx))
-    (start.setRunInfo(new RunInfo(start)) /: defn.RootImports)(addImport)
+    def addImport(ctx: Context, symf: () => Symbol) =
+      ctx.fresh.setImportInfo(ImportInfo.rootImport(symf)(ctx))
+    (start.setRunInfo(new RunInfo(start)) /: defn.RootImportFns)(addImport)
   }
 
-  def newRun(implicit ctx: Context): Run = {
-    try new Run(this)(rootContext)
-    finally {
-      ctx.base.reset()
-      ctx.runInfo.clear()
-    }
+  def reset()(implicit ctx: Context): Unit = {
+    ctx.base.reset()
+    ctx.runInfo.clear()
+  }
+
+  def newRun(implicit ctx: Context, r: Option[Reporter] = None): Run = {
+    reset()
+    new Run(this)(rootContext(ctx, r))
   }
 }

@@ -36,50 +36,42 @@ import Decorators._
 
   override def phaseName = "memoize"
 
-  /** Should to run after mixin so that fields get generated in the
+  /** Should run after mixin so that fields get generated in the
    *  class that contains the concrete getter rather than the trait
    *  that defines it.
    */
   override def runsAfter: Set[Class[_ <: Phase]] = Set(classOf[Mixin])
 
-  override def checkPostCondition(tree: Tree)(implicit ctx: Context): Unit = tree match {
-    case tree: DefDef if !tree.symbol.is(Lazy | Deferred) =>
-      assert(!tree.rhs.isEmpty, i"unimplemented: $tree")
-    case _ =>
-  }
-
-  override def prepareForDefDef(tree: DefDef)(implicit ctx: Context) = {
-    val sym = tree.symbol
-    if (sym.isGetter && !sym.is(NoFieldNeeded)) {
-      // allocate field early so that initializer has the right owner for subsequeny phases in
-      // the group.
-      val maybeMutable = if (sym is Stable) EmptyFlags else Mutable
-      val field = ctx.newSymbol(
-        owner = ctx.owner,
-        name = sym.name.asTermName.fieldName,
-        flags = Private | maybeMutable,
-        info = sym.info.resultType,
-        coord = tree.pos).enteredAfter(thisTransform)
-      tree.rhs.changeOwnerAfter(sym, field, thisTransform)
-    }
-    this
-  }
-
   override def transformDefDef(tree: DefDef)(implicit ctx: Context, info: TransformerInfo): Tree = {
     val sym = tree.symbol
-    def field = {
-      val field = sym.field.asTerm
-      assert(field.exists, i"no field for ${sym.showLocated} in ${sym.owner.info.decls.toList.map{_.showDcl}}%; %")
-      field
+
+    def newField = ctx.newSymbol(
+      owner = ctx.owner,
+      name = sym.name.asTermName.fieldName,
+      flags = Private | (if (sym is Stable) EmptyFlags else Mutable),
+      info = sym.info.resultType,
+      coord = tree.pos)
+      .withAnnotationsCarrying(sym, defn.FieldMetaAnnot)
+      .enteredAfter(thisTransform)
+
+    /** Can be used to filter annotations on getters and setters; not used yet */
+    def keepAnnotations(denot: SymDenotation, meta: ClassSymbol) = {
+      val cpy = sym.copySymDenotation()
+      cpy.filterAnnotations(_.symbol.derivesFrom(meta))
+      if (cpy.annotations ne denot.annotations) cpy.installAfter(thisTransform)
     }
+
+    lazy val field = sym.field.orElse(newField).asTerm
     if (sym.is(Accessor, butNot = NoFieldNeeded))
       if (sym.isGetter) {
-        val fieldDef = transformFollowing(ValDef(field, tree.rhs))
+        var rhs = tree.rhs.changeOwnerAfter(sym, field, thisTransform)
+        if (isWildcardArg(rhs)) rhs = EmptyTree
+        val fieldDef = transformFollowing(ValDef(field, rhs))
         val getterDef = cpy.DefDef(tree)(rhs = transformFollowingDeep(ref(field)))
         Thicket(fieldDef, getterDef)
       }
       else if (sym.isSetter) {
-        if (!sym.is(ParamAccessor)) { val Literal(Constant(())) = tree.rhs }
+        if (!sym.is(ParamAccessor)) { val Literal(Constant(())) = tree.rhs } // this is intended as an assertion
         val initializer = Assign(ref(field), ref(tree.vparamss.head.head.symbol))
         cpy.DefDef(tree)(rhs = transformFollowingDeep(initializer))
       }

@@ -13,6 +13,7 @@ import core.Names._
 import core.NameOps._
 import ast.Trees._
 import SymUtils._
+import dotty.tools.dotc.ast.tpd
 import dotty.tools.dotc.core.Phases.Phase
 import util.Attachment
 import collection.mutable
@@ -27,8 +28,8 @@ import collection.mutable
  *
  *   - add outer parameters to constructors
  *   - pass outer arguments in constructor calls
- *   - replace outer this by outer paths.
  *
+ *   replacement of outer this by outer paths is done in Erasure.
  *   needs to run after pattern matcher as it can add outer checks and force creation of $outer
  */
 class ExplicitOuter extends MiniPhaseTransform with InfoTransformer { thisTransformer =>
@@ -102,6 +103,15 @@ class ExplicitOuter extends MiniPhaseTransform with InfoTransformer { thisTransf
     }
     else impl
   }
+
+  override def transformClosure(tree: Closure)(implicit ctx: Context, info: TransformerInfo): tpd.Tree = {
+    if (tree.tpt ne EmptyTree) {
+      val cls = tree.tpt.asInstanceOf[TypeTree].tpe.classSymbol
+      if (cls.exists && hasOuter(cls.asClass))
+        ctx.error("Not a single abstract method type, requires an outer pointer", tree.pos)
+    }
+    tree
+  }
 }
 
 object ExplicitOuter {
@@ -126,7 +136,9 @@ object ExplicitOuter {
 
   /** A new outer accessor or param accessor */
   private def newOuterSym(owner: ClassSymbol, cls: ClassSymbol, name: TermName, flags: FlagSet)(implicit ctx: Context) = {
-    ctx.newSymbol(owner, name, Synthetic | flags, cls.owner.enclosingClass.typeRef, coord = cls.coord)
+    val target = cls.owner.enclosingClass.typeRef
+    val info = if (flags.is(Method)) ExprType(target) else target
+    ctx.newSymbol(owner, name, Synthetic | flags, info, coord = cls.coord)
   }
 
   /** A new param accessor for the outer field in class `cls` */
@@ -203,7 +215,7 @@ object ExplicitOuter {
       case id: Ident =>
         id.tpe match {
           case ref @ TermRef(NoPrefix, _) =>
-            ref.symbol.is(Method) && isOuter(id.symbol.owner.enclosingClass)
+            ref.symbol.is(Hoistable) && isOuter(id.symbol.owner.enclosingClass)
             // methods will be placed in enclosing class scope by LambdaLift, so they will get
             // an outer path then.
           case _ => false
@@ -211,9 +223,11 @@ object ExplicitOuter {
       case nw: New =>
         isOuter(nw.tpe.classSymbol.owner.enclosingClass)
       case _ =>
-       false
+        false
     }
   }
+
+  private final val Hoistable = Method | Lazy | Module
 
   /** The outer prefix implied by type `tpe` */
   private def outerPrefix(tpe: Type)(implicit ctx: Context): Type = tpe match {
@@ -245,7 +259,7 @@ object ExplicitOuter {
    *     they cannot be added before erasure.
    *   - outer arguments need access to outer parameters as well as to the
    *     original type prefixes of types in New expressions. These prefixes
-   *     get erased during erasure. Therefore, outer argumenrts have to be passed
+   *     get erased during erasure. Therefore, outer arguments have to be passed
    *     no later than erasure.
    */
   class OuterOps(val ictx: Context) extends AnyVal {
@@ -287,9 +301,10 @@ object ExplicitOuter {
     def path(toCls: Symbol): Tree = try {
       def loop(tree: Tree): Tree = {
         val treeCls = tree.tpe.widen.classSymbol
-        ctx.log(i"outer to $toCls of $tree: ${tree.tpe}, looking for ${outerAccName(treeCls.asClass)}")
+        val outerAccessorCtx = ctx.withPhaseNoLater(ctx.lambdaLiftPhase) // lambdalift mangles local class names, which means we cannot reliably find outer acessors anymore
+        ctx.log(i"outer to $toCls of $tree: ${tree.tpe}, looking for ${outerAccName(treeCls.asClass)(outerAccessorCtx)} in $treeCls")
         if (treeCls == toCls) tree
-        else loop(tree select outerAccessor(treeCls.asClass))
+        else loop(tree.select(outerAccessor(treeCls.asClass)(outerAccessorCtx)).ensureApplied)
       }
       ctx.log(i"computing outerpath to $toCls from ${ctx.outersIterator.map(_.owner).toList}")
       loop(This(ctx.owner.enclosingClass.asClass))
@@ -297,5 +312,14 @@ object ExplicitOuter {
       case ex: ClassCastException =>
         throw new ClassCastException(i"no path exists from ${ctx.owner.enclosingClass} to $toCls")
     }
+
+    /** The outer parameter definition of a constructor if it needs one */
+    def paramDefs(constr: Symbol): List[ValDef] =
+      if (constr.isConstructor && hasOuterParam(constr.owner.asClass)) {
+        val MethodType(outerName :: _, outerType :: _) = constr.info
+        val outerSym = ctx.newSymbol(constr, outerName, Param, outerType)
+        ValDef(outerSym) :: Nil
+      }
+      else Nil
   }
 }

@@ -11,8 +11,8 @@ object LazyVals {
   final val BITS_PER_LAZY_VAL = 2
   final val LAZY_VAL_MASK = 3
 
-  @inline def STATE(cur: Long, ord: Long) = (cur >> (ord * BITS_PER_LAZY_VAL)) & LAZY_VAL_MASK
-  @inline def CAS(t: Object, offset: Long, e: Long, v: Long, ord: Int) = {
+  @inline def STATE(cur: Long, ord: Int) = (cur >> (ord * BITS_PER_LAZY_VAL)) & LAZY_VAL_MASK
+  @inline def CAS(t: Object, offset: Long, e: Long, v: Int, ord: Int) = {
     val mask = ~(LAZY_VAL_MASK << ord * BITS_PER_LAZY_VAL)
     val n = (e & mask) | (v << (ord * BITS_PER_LAZY_VAL))
     compareAndSet(t, offset, e, n)
@@ -60,12 +60,15 @@ object LazyVals {
   }.toArray
 
   @inline def getMonitor(obj: Object, fieldId: Int = 0) = {
-    var id = (java.lang.System.identityHashCode(obj) + fieldId) % base
+    var id = (
+      /*java.lang.System.identityHashCode(obj) + */ // should be here, but #548
+      fieldId) % base
+
     if (id < 0) id += base
     monitors(id)
   }
 
-  @inline def getOffset(obj: Object, name: String) = unsafe.objectFieldOffset(obj.getClass.getDeclaredField(name))
+  @inline def getOffset(clz: Class[_], name: String) = unsafe.objectFieldOffset(clz.getDeclaredField(name))
 
   object Names {
     final val state = "STATE"

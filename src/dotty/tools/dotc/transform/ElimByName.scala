@@ -47,7 +47,7 @@ import ast.Trees._
  *  other options which have been abandoned or not yet pursued.
  *
  *  Option 1: Transform => T to () => T also in method and function types. The problem with this is
- *  that is that it rewuires to look at every type, and this forces too much, causing
+ *  that is that it requires to look at every type, and this forces too much, causing
  *  Cyclic Reference errors. Abandoned for this reason.
  *
  *  Option 2: Merge ElimByName with erasure, or have it run immediately before. This has not been
@@ -73,7 +73,8 @@ class ElimByName extends MiniPhaseTransform with InfoTransformer { thisTransform
       case formalExpr: ExprType =>
         val argType = arg.tpe.widen
         val argFun = arg match {
-          case Apply(Select(qual, nme.apply), Nil) if qual.tpe derivesFrom defn.FunctionClass(0) =>
+          case Apply(Select(qual, nme.apply), Nil)
+          if qual.tpe.derivesFrom(defn.FunctionClass(0)) && isPureExpr(qual) =>
             qual
           case _ =>
             val meth = ctx.newSymbol(

@@ -31,25 +31,30 @@ import scala.language.postfixOps
  *    def equals(other: Any): Boolean
  *    def hashCode(): Int
  */
-class SyntheticMethods extends MiniPhaseTransform with IdentityDenotTransformer { thisTransformer =>
+class SyntheticMethods(thisTransformer: DenotTransformer) {
   import ast.tpd._
 
-  override def phaseName = "synthetics"
+  private var myValueSymbols: List[Symbol] = Nil
+  private var myCaseSymbols: List[Symbol] = Nil
 
-  private var valueSymbols: List[Symbol] = _
-  private var caseSymbols: List[Symbol] = _
+  private def initSymbols(implicit ctx: Context) =
+    if (myValueSymbols.isEmpty) {
+      myValueSymbols = List(defn.Any_hashCode, defn.Any_equals)
+      myCaseSymbols = myValueSymbols ++ List(defn.Any_toString, defn.Product_canEqual, defn.Product_productArity)
+    }
 
-  override def prepareForUnit(tree: Tree)(implicit ctx: Context) = {
-    valueSymbols = List(defn.Any_hashCode, defn.Any_equals)
-    caseSymbols = valueSymbols ++ List(defn.Any_toString, defn.Product_canEqual, defn.Product_productArity)
-    this
-  }
+  def valueSymbols(implicit ctx: Context) = { initSymbols; myValueSymbols }
+  def caseSymbols(implicit ctx: Context) = { initSymbols; myCaseSymbols }
 
   /** The synthetic methods of the case or value class `clazz`.
    */
   def syntheticMethods(clazz: ClassSymbol)(implicit ctx: Context): List[Tree] = {
     val clazzType = clazz.typeRef
-    lazy val accessors = clazz.caseAccessors
+    lazy val accessors =
+      if (isDerivedValueClass(clazz))
+        clazz.termParamAccessors
+      else
+        clazz.caseAccessors
 
     val symbolsToSynthesize: List[Symbol] =
       if (clazz.is(Case)) caseSymbols
@@ -72,7 +77,8 @@ class SyntheticMethods extends MiniPhaseTransform with IdentityDenotTransformer 
         ref(defn.runtimeMethod("_" + sym.name.toString)).appliedToArgs(This(clazz) :: vrefss.head)
 
       def syntheticRHS(implicit ctx: Context): List[List[Tree]] => Tree = synthetic.name match {
-        case nme.hashCode_ => vrefss => hashCodeBody
+        case nme.hashCode_ if isDerivedValueClass(clazz) => vrefss => valueHashCodeBody
+        case nme.hashCode_ => vrefss => caseHashCodeBody
         case nme.toString_ => forwardToRuntime
         case nme.equals_ => vrefss => equalsBody(vrefss.head.head)
         case nme.canEqual_ => vrefss => canEqualBody(vrefss.head.head)
@@ -99,8 +105,7 @@ class SyntheticMethods extends MiniPhaseTransform with IdentityDenotTransformer 
      */
     def equalsBody(that: Tree)(implicit ctx: Context): Tree = {
       val thatAsClazz = ctx.newSymbol(ctx.owner, nme.x_0, Synthetic, clazzType, coord = ctx.owner.pos) // x$0
-      def wildcardAscription(tp: Type) =
-        Typed(untpd.Ident(nme.WILDCARD).withType(tp), TypeTree(tp))
+      def wildcardAscription(tp: Type) = Typed(Underscore(tp), TypeTree(tp))
       val pattern = Bind(thatAsClazz, wildcardAscription(clazzType)) // x$0 @ (_: C)
       val comparisons = accessors map (accessor =>
         This(clazz).select(accessor).select(defn.Any_==).appliedTo(ref(thatAsClazz).select(accessor)))
@@ -118,9 +123,22 @@ class SyntheticMethods extends MiniPhaseTransform with IdentityDenotTransformer 
 
     /** The class
      *
+     *  class C(x: T) extends AnyVal
+     *
+     *  gets the hashCode method:
+     *
+     *    def hashCode: Int = x.hashCode()
+     */
+    def valueHashCodeBody(implicit ctx: Context): Tree = {
+      assert(accessors.length == 1)
+      ref(accessors.head).select(nme.hashCode_).ensureApplied
+    }
+
+    /** The class
+     *
      *    case class C(x: T, y: T)
      *
-     *  get the hashCode method:
+     *  gets the hashCode method:
      *
      *    def hashCode: Int = {
      *      <synthetic> var acc: Int = 0xcafebabe;
@@ -129,7 +147,7 @@ class SyntheticMethods extends MiniPhaseTransform with IdentityDenotTransformer 
      *      Statics.finalizeHash(acc, 2)
      *    }
      */
-    def hashCodeBody(implicit ctx: Context): Tree = {
+    def caseHashCodeBody(implicit ctx: Context): Tree = {
       val acc = ctx.newSymbol(ctx.owner, "acc".toTermName, Mutable | Synthetic, defn.IntType, coord = ctx.owner.pos)
       val accDef = ValDef(acc, Literal(Constant(0xcafebabe)))
       val mixes = for (accessor <- accessors.toList) yield
@@ -167,10 +185,9 @@ class SyntheticMethods extends MiniPhaseTransform with IdentityDenotTransformer 
     symbolsToSynthesize flatMap syntheticDefIfMissing
   }
 
-  override def transformTemplate(impl: Template)(implicit ctx: Context, info: TransformerInfo) =
+  def addSyntheticMethods(impl: Template)(implicit ctx: Context) =
     if (ctx.owner.is(Case) || isDerivedValueClass(ctx.owner))
-      cpy.Template(impl)(
-        body = impl.body ++ syntheticMethods(ctx.owner.asClass))
+      cpy.Template(impl)(body = impl.body ++ syntheticMethods(ctx.owner.asClass))
     else
       impl
 }

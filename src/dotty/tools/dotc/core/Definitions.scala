@@ -4,7 +4,7 @@ package core
 
 import Types._, Contexts._, Symbols._, Denotations._, SymDenotations._, StdNames._, Names._
 import Flags._, Scopes._, Decorators._, NameOps._, util.Positions._
-import pickling.UnPickler.ensureConstructor
+import unpickleScala2.Scala2Unpickler.ensureConstructor
 import scala.annotation.{ switch, meta }
 import scala.collection.{ mutable, immutable }
 import PartialFunction._
@@ -99,8 +99,13 @@ class Definitions {
   lazy val RootPackage: TermSymbol = ctx.newSymbol(
     NoSymbol, nme.ROOTPKG, PackageCreationFlags, TypeRef(NoPrefix, RootClass))
 
-  lazy val EmptyPackageClass = ctx.newCompletePackageSymbol(RootClass, nme.EMPTY_PACKAGE).moduleClass.asClass
-  lazy val EmptyPackageVal = EmptyPackageClass.sourceModule.entered
+  lazy val EmptyPackageVal = ctx.newPackageSymbol(
+    RootClass, nme.EMPTY_PACKAGE, (emptypkg, emptycls) => ctx.rootLoader(emptypkg)).entered
+  lazy val EmptyPackageClass = EmptyPackageVal.moduleClass.asClass
+
+  /** A package in which we can place all methods that are interpreted specially by the compiler */
+  lazy val OpsPackageVal = ctx.newCompletePackageSymbol(RootClass, nme.OPS_PACKAGE).entered
+  lazy val OpsPackageClass = OpsPackageVal.moduleClass.asClass
 
   lazy val ScalaPackageVal = ctx.requiredPackage("scala")
   lazy val ScalaMathPackageVal = ctx.requiredPackage("scala.math")
@@ -174,8 +179,12 @@ class Definitions {
 
   /** Dummy method needed by elimByName */
   lazy val dummyApply = newPolyMethod(
-      RootClass, nme.dummyApply, 1,
+      OpsPackageClass, nme.dummyApply, 1,
       pt => MethodType(List(FunctionType(Nil, PolyParam(pt, 0))), PolyParam(pt, 0)))
+
+  /** Method representing a throw */
+  lazy val throwMethod = newMethod(OpsPackageClass, nme.THROWkw,
+      MethodType(List(ThrowableType), NothingType))
 
   lazy val NothingClass: ClassSymbol = newCompleteClassSymbol(
     ScalaPackageClass, tpnme.Nothing, AbstractFinal, List(AnyClass.typeRef))
@@ -262,6 +271,16 @@ class Definitions {
   lazy val BoxedFloatClass = ctx.requiredClass("java.lang.Float")
   lazy val BoxedDoubleClass = ctx.requiredClass("java.lang.Double")
 
+  lazy val BoxedBooleanModule = ctx.requiredModule("java.lang.Boolean")
+  lazy val BoxedByteModule    = ctx.requiredModule("java.lang.Byte")
+  lazy val BoxedShortModule   = ctx.requiredModule("java.lang.Short")
+  lazy val BoxedCharModule    = ctx.requiredModule("java.lang.Character")
+  lazy val BoxedIntModule     = ctx.requiredModule("java.lang.Integer")
+  lazy val BoxedLongModule    = ctx.requiredModule("java.lang.Long")
+  lazy val BoxedFloatModule   = ctx.requiredModule("java.lang.Float")
+  lazy val BoxedDoubleModule  = ctx.requiredModule("java.lang.Double")
+  lazy val BoxedVoidModule    = ctx.requiredModule("java.lang.Void")
+
   lazy val ByNameParamClass2x     = specialPolyClass(tpnme.BYNAME_PARAM_CLASS, Covariant, AnyType)
   lazy val EqualsPatternClass     = specialPolyClass(tpnme.EQUALS_PATTERN, EmptyFlags, AnyType)
 
@@ -327,6 +346,8 @@ class Definitions {
   lazy val ContravariantBetweenClass = ctx.requiredClass("dotty.annotation.internal.ContravariantBetween")
   lazy val ScalaSignatureAnnot = ctx.requiredClass("scala.reflect.ScalaSignature")
   lazy val ScalaLongSignatureAnnot = ctx.requiredClass("scala.reflect.ScalaLongSignature")
+  lazy val TASTYSignatureAnnot = ctx.requiredClass("scala.annotation.internal.TASTYSignature")
+  lazy val TASTYLongSignatureAnnot = ctx.requiredClass("scala.annotation.internal.TASTYLongSignature")
   lazy val DeprecatedAnnot = ctx.requiredClass("scala.deprecated")
   lazy val MigrationAnnot = ctx.requiredClass("scala.annotation.migration")
   lazy val AnnotationDefaultAnnot = ctx.requiredClass("dotty.annotation.internal.AnnotationDefault")
@@ -335,6 +356,9 @@ class Definitions {
   lazy val UncheckedStableAnnot = ctx.requiredClass("scala.annotation.unchecked.uncheckedStable")
   lazy val UncheckedVarianceAnnot = ctx.requiredClass("scala.annotation.unchecked.uncheckedVariance")
   lazy val VolatileAnnot = ctx.requiredClass("scala.volatile")
+  lazy val FieldMetaAnnot = ctx.requiredClass("scala.annotation.meta.field")
+  lazy val GetterMetaAnnot = ctx.requiredClass("scala.annotation.meta.getter")
+  lazy val SetterMetaAnnot = ctx.requiredClass("scala.annotation.meta.setter")
 
   // convenient one-parameter method types
   def methOfAny(tp: Type) = MethodType(List(AnyType), tp)
@@ -438,9 +462,10 @@ class Definitions {
 
   lazy val isPolymorphicAfterErasure = Set[Symbol](Any_isInstanceOf, Any_asInstanceOf, newRefArrayMethod)
 
-  lazy val RootImports = List[Symbol](JavaLangPackageVal, ScalaPackageVal, ScalaPredefModule, DottyPredefModule)
+  val RootImportFns = List[() => Symbol](() => JavaLangPackageVal, () => ScalaPackageVal, () => ScalaPredefModule, () => DottyPredefModule)
 
-  lazy val overriddenBySynthetic = Set[Symbol](Any_equals, Any_hashCode, Any_toString, Product_canEqual)
+  lazy val RootImports = RootImportFns.map(_())
+
   def isTupleType(tp: Type)(implicit ctx: Context) = {
     val arity = tp.dealias.argInfos.length
     arity <= MaxTupleArity && (tp isRef TupleClass(arity))
@@ -527,7 +552,7 @@ class Definitions {
 
   // ----- primitive value class machinery ------------------------------------------
 
-  lazy val ScalaNumericValueClasses: collection.Set[Symbol] =  Set(
+  lazy val ScalaNumericValueClassList = List(
     ByteClass,
     ShortClass,
     CharClass,
@@ -536,6 +561,7 @@ class Definitions {
     FloatClass,
     DoubleClass)
 
+  lazy val ScalaNumericValueClasses: collection.Set[Symbol] = ScalaNumericValueClassList.toSet
   lazy val ScalaValueClasses: collection.Set[Symbol] = ScalaNumericValueClasses + UnitClass + BooleanClass
 
   lazy val ScalaBoxedClasses = ScalaValueClasses map boxedClass
@@ -605,7 +631,8 @@ class Definitions {
     NothingClass,
     SingletonClass,
     EqualsPatternClass,
-    EmptyPackageVal)
+    EmptyPackageVal,
+    OpsPackageClass)
 
     /** Lists core methods that don't have underlying bytecode, but are synthesized on-the-fly in every reflection universe */
     lazy val syntheticCoreMethods = AnyMethods ++ ObjectMethods ++ List(String_+)

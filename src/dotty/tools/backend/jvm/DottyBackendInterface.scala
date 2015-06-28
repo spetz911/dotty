@@ -13,7 +13,7 @@ import scala.collection.mutable
 import scala.reflect.ClassTag
 import scala.reflect.internal.util.WeakHashSet
 import scala.reflect.io.{Directory, PlainDirectory, AbstractFile}
-import scala.tools.asm.{ClassVisitor, FieldVisitor, MethodVisitor}
+import scala.tools.asm.{AnnotationVisitor, ClassVisitor, FieldVisitor, MethodVisitor}
 import scala.tools.nsc.backend.jvm.{BCodeHelpers, BackendInterface}
 import dotty.tools.dotc.core._
 import Periods._
@@ -27,10 +27,12 @@ import java.lang.AssertionError
 import dotty.tools.dotc.util.{Positions, DotClass}
 import Decorators._
 import tpd._
+import scala.tools.asm
+import NameOps._
 import StdNames.nme
+import NameOps._
 
 class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
-  trait NonExistentTree extends tpd.Tree
   type Symbol          = Symbols.Symbol
   type Type            = Types.Type
   type Tree            = tpd.Tree
@@ -48,7 +50,7 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
   type Ident           = tpd.Ident
   type If              = tpd.If
   type ValDef          = tpd.ValDef
-  type Throw           = tpd.Throw
+  type Throw           = tpd.Apply
   type Return          = tpd.Return
   type Block           = tpd.Block
   type Typed           = tpd.Typed
@@ -58,15 +60,15 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
   type Alternative     = tpd.Alternative
   type DefDef          = tpd.DefDef
   type Template        = tpd.Template
-  type Select          = tpd.Select
+  type Select          = tpd.Tree // Actually tpd.Select || tpd.Ident
   type Bind            = tpd.Bind
   type New             = tpd.New
   type Super           = tpd.Super
   type Modifiers       = tpd.Modifiers
-  type Annotation      = NonExistentTree
+  type Annotation      = Annotations.Annotation
   type ArrayValue      = tpd.JavaSeqLiteral
-  type ApplyDynamic    = NonExistentTree
-  type ModuleDef       = NonExistentTree
+  type ApplyDynamic    = Null
+  type ModuleDef       = Null
   type LabelDef        = tpd.DefDef
   type Closure         = tpd.Closure
 
@@ -100,6 +102,10 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
   val BoxesRunTimeModule     = ctx.requiredModule("scala.runtime.BoxesRunTime")
   val BoxesRunTimeClass      = toDenot(BoxesRunTimeModule).moduleClass.asClass
 
+   // require LambdaMetafactory: scalac uses getClassIfDefined, but we need those always.
+  override lazy val LambdaMetaFactory = ctx.requiredClass("java.lang.invoke.LambdaMetafactory")
+  override lazy val MethodHandle      = ctx.requiredClass("java.lang.invoke.MethodHandle")
+
   val nme_valueOf: Name = StdNames.nme.valueOf
   val nme_apply = StdNames.nme.apply
   val NothingClass: Symbol = defn.NothingClass
@@ -130,13 +136,21 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
   val externalEqualsNumNum: Symbol = ctx.requiredMethod(BoxesRunTimeClass, nme.equalsNumNum)
   lazy val externalEqualsNumChar: Symbol = ??? // ctx.requiredMethod(BoxesRunTimeClass, nme.equalsNumChar) // this method is private
   val externalEqualsNumObject: Symbol = ctx.requiredMethod(BoxesRunTimeClass, nme.equalsNumObject)
-  val externalEquals: Symbol = ctx.requiredMethod(BoxesRunTimeClass, nme.equals_)
+  val externalEquals: Symbol = BoxesRunTimeClass.info.decl(nme.equals_).suchThat(toDenot(_).info.firstParamTypes.size == 2).symbol
   val MaxFunctionArity: Int = Definitions.MaxFunctionArity
   val FunctionClass: Array[Symbol] = defn.FunctionClass.asInstanceOf[Array[Symbol]]
   val AbstractFunctionClass: Array[Symbol] = defn.AbstractFunctionClass.asInstanceOf[Array[Symbol]]
   val PartialFunctionClass: Symbol = defn.PartialFunctionClass
   val AbstractPartialFunctionClass: Symbol = defn.AbstractPartialFunctionClass
   val String_valueOf: Symbol = defn.String_valueOf_Object
+  lazy val Predef_classOf: Symbol = ctx.requiredMethod(toDenot(defn.ScalaPredefModule).moduleClass.asClass, nme.classOf)
+
+  lazy val AnnotationRetentionAttr = ctx.requiredClass("java.lang.annotation.Retention")
+  lazy val AnnotationRetentionSourceAttr = ctx.requiredClass("java.lang.annotation.RetentionPolicy").linkedClass.requiredValue("SOURCE")
+  lazy val AnnotationRetentionClassAttr = ctx.requiredClass("java.lang.annotation.RetentionPolicy").linkedClass.requiredValue("CLASS")
+  lazy val AnnotationRetentionRuntimeAttr = ctx.requiredClass("java.lang.annotation.RetentionPolicy").linkedClass.requiredValue("RUNTIME")
+  lazy val JavaAnnotationClass = ctx.requiredClass("java.lang.annotation.Annotation")
+
 
   def boxMethods: Map[Symbol, Symbol] = defn.ScalaValueClasses.map{x =>
     (x, Erasure.Boxing.boxMethod(x.asClass))
@@ -191,13 +205,146 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
   implicit val ClosureTag: ClassTag[Closure] = ClassTag[Closure](classOf[Closure])
 
   /* dont emit any annotations for now*/
-  def isRuntimeVisible(annot: Annotation): Boolean = false
-  def shouldEmitAnnotation(annot: Annotation): Boolean = false
+  def isRuntimeVisible(annot: Annotation): Boolean = {
+    annot.atp.typeSymbol.getAnnotation(AnnotationRetentionAttr) match {
+      case Some(retentionAnnot) =>
+        retentionAnnot.tree.find(_.symbol == AnnotationRetentionRuntimeAttr).isDefined
+      case _ =>
+        // SI-8926: if the annotation class symbol doesn't have a @RetentionPolicy annotation, the
+        // annotation is emitted with visibility `RUNTIME`
+        // dotty bug: #389
+        true
+    }
+  }
 
-  def emitAnnotations(cw: ClassVisitor, annotations: List[Annotation], bcodeStore: BCodeHelpers)(innerClasesStore: bcodeStore.BCInnerClassGen): Unit = ()
-  def emitAnnotations(mw: MethodVisitor, annotations: List[Annotation], bcodeStore: BCodeHelpers)(innerClasesStore: bcodeStore.BCInnerClassGen): Unit = ()
-  def emitAnnotations(fw: FieldVisitor, annotations: List[Annotation], bcodeStore: BCodeHelpers)(innerClasesStore: bcodeStore.BCInnerClassGen): Unit = ()
-  def emitParamAnnotations(jmethod: MethodVisitor, pannotss: List[List[Annotation]], bcodeStore: BCodeHelpers)(innerClasesStore: bcodeStore.BCInnerClassGen): Unit = ()
+  def shouldEmitAnnotation(annot: Annotation): Boolean = {
+    annot.symbol.isJavaDefined &&
+      retentionPolicyOf(annot) != AnnotationRetentionSourceAttr &&
+      annot.args.isEmpty
+  }
+
+  private def retentionPolicyOf(annot: Annotation): Symbol =
+    annot.atp.typeSymbol.getAnnotation(AnnotationRetentionAttr).
+      flatMap(_.argument(0).map(_.symbol)).getOrElse(AnnotationRetentionClassAttr)
+
+  private def emitArgument(av:   AnnotationVisitor,
+                           name: String,
+                           arg:  Tree, bcodeStore: BCodeHelpers)(innerClasesStore: bcodeStore.BCInnerClassGen): Unit = {
+    (arg: @unchecked) match {
+
+      case Literal(const @ Constant(_)) =>
+        const.tag match {
+          case BooleanTag | ByteTag | ShortTag | CharTag | IntTag | LongTag | FloatTag | DoubleTag => av.visit(name, const.value)
+          case StringTag =>
+            assert(const.value != null, const) // TODO this invariant isn't documented in `case class Constant`
+            av.visit(name, const.stringValue) // `stringValue` special-cases null, but that execution path isn't exercised for a const with StringTag
+          case ClazzTag => av.visit(name, const.typeValue.toTypeKind(bcodeStore)(innerClasesStore).toASMType)
+          case EnumTag =>
+            val edesc = innerClasesStore.typeDescriptor(const.tpe.asInstanceOf[bcodeStore.int.Type]) // the class descriptor of the enumeration class.
+            val evalue = const.symbolValue.name.toString // value the actual enumeration value.
+            av.visitEnum(name, edesc, evalue)
+        }
+      case t: TypeApply if (t.fun.symbol == Predef_classOf) =>
+        av.visit(name, t.args.head.tpe.classSymbol.denot.info.toTypeKind(bcodeStore)(innerClasesStore).toASMType)
+      case t: tpd.Select =>
+        if (t.symbol.denot.is(Flags.Enum)) {
+          val edesc = innerClasesStore.typeDescriptor(t.tpe.asInstanceOf[bcodeStore.int.Type]) // the class descriptor of the enumeration class.
+          val evalue = t.symbol.name.toString // value the actual enumeration value.
+          av.visitEnum(name, edesc, evalue)
+        } else {
+          assert(toDenot(t.symbol).name.toTermName.defaultGetterIndex >= 0) // this should be default getter. do not emmit.
+        }
+      case t: SeqLiteral =>
+        val arrAnnotV: AnnotationVisitor = av.visitArray(name)
+        for(arg <- t.elems) { emitArgument(arrAnnotV, null, arg, bcodeStore)(innerClasesStore) }
+        arrAnnotV.visitEnd()
+
+      case Apply(fun, args) if (fun.symbol == defn.ArrayClass.primaryConstructor ||
+        (toDenot(fun.symbol).owner == defn.ArrayClass.linkedClass && fun.symbol.name == nme_apply)) =>
+        val arrAnnotV: AnnotationVisitor = av.visitArray(name)
+
+        var actualArgs = if (fun.tpe.isInstanceOf[ImplicitMethodType]) {
+          // generic array method, need to get implicit argument out of the way
+          fun.asInstanceOf[Apply].args
+        } else args
+
+        val flatArgs = actualArgs.flatMap {
+          case t: tpd.SeqLiteral => t.elems
+          case e => List(e)
+        }
+        for(arg <- flatArgs) { emitArgument(arrAnnotV, null, arg, bcodeStore)(innerClasesStore) }
+        arrAnnotV.visitEnd()
+/*
+      case sb @ ScalaSigBytes(bytes) =>
+        // see http://www.scala-lang.org/sid/10 (Storage of pickled Scala signatures in class files)
+        // also JVMS Sec. 4.7.16.1 The element_value structure and JVMS Sec. 4.4.7 The CONSTANT_Utf8_info Structure.
+        if (sb.fitsInOneString) {
+          av.visit(name, BCodeAsmCommon.strEncode(sb))
+        } else {
+          val arrAnnotV: asm.AnnotationVisitor = av.visitArray(name)
+          for(arg <- BCodeAsmCommon.arrEncode(sb)) { arrAnnotV.visit(name, arg) }
+          arrAnnotV.visitEnd()
+        }          // for the lazy val in ScalaSigBytes to be GC'ed, the invoker of emitAnnotations() should hold the ScalaSigBytes in a method-local var that doesn't escape.
+*/
+      case t @ Apply(constr, args) if t.tpe.derivesFrom(JavaAnnotationClass) =>
+        val typ = t.tpe.classSymbol.denot.info
+        val assocs = assocsFromApply(t)
+        val desc = innerClasesStore.typeDescriptor(typ.asInstanceOf[bcodeStore.int.Type]) // the class descriptor of the nested annotation class
+        val nestedVisitor = av.visitAnnotation(name, desc)
+        emitAssocs(nestedVisitor, assocs, bcodeStore)(innerClasesStore)
+    }
+  }
+
+  override def emitAnnotations(cw: asm.ClassVisitor, annotations: List[Annotation], bcodeStore: BCodeHelpers)
+                              (innerClasesStore: bcodeStore.BCInnerClassGen) = {
+    for(annot <- annotations; if shouldEmitAnnotation(annot)) {
+      val typ = annot.atp
+      val assocs = annot.assocs
+      val av = cw.visitAnnotation(innerClasesStore.typeDescriptor(typ.asInstanceOf[bcodeStore.int.Type]), isRuntimeVisible(annot))
+      emitAssocs(av, assocs, bcodeStore)(innerClasesStore)
+    }
+  }
+
+  private def emitAssocs(av: asm.AnnotationVisitor, assocs: List[(Name, Object)], bcodeStore: BCodeHelpers)
+                        (innerClasesStore: bcodeStore.BCInnerClassGen) = {
+    for ((name, value) <- assocs)
+      emitArgument(av, name.toString, value.asInstanceOf[Tree], bcodeStore)(innerClasesStore)
+    av.visitEnd()
+  }
+
+  override def emitAnnotations(mw: asm.MethodVisitor, annotations: List[Annotation], bcodeStore: BCodeHelpers)
+                              (innerClasesStore: bcodeStore.BCInnerClassGen) = {
+    for(annot <- annotations; if shouldEmitAnnotation(annot)) {
+      val typ = annot.atp
+      val assocs = annot.assocs
+      val av = mw.visitAnnotation(innerClasesStore.typeDescriptor(typ.asInstanceOf[bcodeStore.int.Type]), isRuntimeVisible(annot))
+      emitAssocs(av, assocs, bcodeStore)(innerClasesStore)
+    }
+  }
+
+  override def emitAnnotations(fw: asm.FieldVisitor, annotations: List[Annotation], bcodeStore: BCodeHelpers)
+                              (innerClasesStore: bcodeStore.BCInnerClassGen) = {
+    for(annot <- annotations; if shouldEmitAnnotation(annot)) {
+      val typ = annot.atp
+      val assocs = annot.assocs
+      val av = fw.visitAnnotation(innerClasesStore.typeDescriptor(typ.asInstanceOf[bcodeStore.int.Type]), isRuntimeVisible(annot))
+      emitAssocs(av, assocs, bcodeStore)(innerClasesStore)
+    }
+  }
+
+  override def emitParamAnnotations(jmethod: asm.MethodVisitor, pannotss: List[List[Annotation]], bcodeStore: BCodeHelpers)
+                                   (innerClasesStore: bcodeStore.BCInnerClassGen): Unit = {
+    val annotationss = pannotss map (_ filter shouldEmitAnnotation)
+    if (annotationss forall (_.isEmpty)) return
+    for ((annots, idx) <- annotationss.zipWithIndex;
+         annot <- annots) {
+      val typ = annot.atp
+      val assocs = annot.assocs
+      val pannVisitor: asm.AnnotationVisitor = jmethod.visitParameterAnnotation(idx, innerClasesStore.typeDescriptor(typ.asInstanceOf[bcodeStore.int.Type]), isRuntimeVisible(annot))
+      emitAssocs(pannVisitor, assocs, bcodeStore)(innerClasesStore)
+    }
+  }
+
   def getAnnotPickle(jclassName: String, sym: Symbol): Option[Annotation] = None
 
 
@@ -236,7 +383,7 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
   def shouldEmitJumpAfterLabels = true
 
   def dumpClasses: Option[String] =
-    if(ctx.settings.Ydumpclasses.isDefault) None
+    if (ctx.settings.Ydumpclasses.isDefault) None
     else Some(ctx.settings.Ydumpclasses.value)
 
   def mainClass: Option[String] =
@@ -276,12 +423,15 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
 
 
   def isQualifierSafeToElide(qual: Tree): Boolean = tpd.isIdempotentExpr(qual)
-  def desugarIdent(i: Ident): Option[Select] = {
+  def desugarIdent(i: Ident): Option[tpd.Select] = {
     i.tpe match {
       case TermRef(prefix: TermRef, name) =>
         Some(tpd.ref(prefix).select(i.symbol))
       case TermRef(prefix: ThisType, name) =>
         Some(tpd.This(prefix.cls).select(i.symbol))
+      case TermRef(NoPrefix, name) =>
+        if (i.symbol is Flags.Method) Some(This(i.symbol.topLevelClass).select(i.symbol)) // workaround #342 todo: remove after fixed
+        else None
       case _ => None
     }
   }
@@ -292,7 +442,7 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
     val t = new TreeTraverser {
       var outerRhs: Tree = tree
 
-      def traverse(tree: tpd.Tree): Unit = tree match {
+      def traverse(tree: tpd.Tree)(implicit ctx: Context): Unit = tree match {
         case t: DefDef =>
           if (t.symbol is Flags.Label)
             res.put(outerRhs, t :: res.getOrElse(outerRhs, Nil))
@@ -367,11 +517,21 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
   implicit def annotHelper(a: Annotation): AnnotationHelper = new AnnotationHelper {
     def atp: Type = a.tree.tpe
 
-    def assocs: List[(Name, Object)] = ???
+    def assocs: List[(Name, Tree)] = assocsFromApply(a.tree)
 
     def symbol: Symbol = a.tree.symbol
 
-    def args: List[Tree] = ???
+    def args: List[Tree] = List.empty // those arguments to scala-defined annotations. they are never emmited
+  }
+
+  def assocsFromApply(tree: Tree) = {
+    tree match {
+      case Apply(fun, args) =>
+        fun.tpe.widen match {
+          case MethodType(names, _) =>
+            names zip args
+        }
+    }
   }
 
 
@@ -379,7 +539,7 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
     def toTypeName: Name = n.toTypeName
     def isTypeName: Boolean = n.isTypeName
     def toTermName: Name = n.toTermName
-    def dropModule: Name = ???
+    def dropModule: Name = n.stripModuleClassSuffix
 
     def len: Int = n.length
     def offset: Int = n.start
@@ -394,7 +554,7 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
     def fullName: String = sym.showFullName
     def simpleName: Name = sym.name
     def javaSimpleName: Name = toDenot(sym).name // addModuleSuffix(simpleName.dropLocal)
-    def javaBinaryName: Name = toDenot(sym).fullNameSeparated('/') // addModuleSuffix(fullNameInternal('/'))
+    def javaBinaryName: Name = toDenot(sym).fullNameSeparated("/") // addModuleSuffix(fullNameInternal('/'))
     def javaClassName: String = toDenot(sym).fullName.toString// addModuleSuffix(fullNameInternal('.')).toString
     def name: Name = sym.name
     def rawname: Name = sym.name // todo ????
@@ -406,7 +566,7 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
 
     // tests
     def isClass: Boolean = {
-      sym.isClass && (sym.isPackageObject || !(sym is Flags.Package))
+      sym.isPackageObject || (sym.isClass)
     }
     def isType: Boolean = sym.isType
     def isAnonymousClass: Boolean = toDenot(sym).isAnonymousClass
@@ -432,7 +592,7 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
     def isDeferred: Boolean = sym is Flags.Deferred
     def isPrivate: Boolean = sym is Flags.Private
     def getsJavaFinalFlag: Boolean =
-      isFinal &&  !toDenot(sym).isClassConstructor && !(sym is Flags.Mutable) &&  !(sym.enclosingClass is Flags.JavaInterface)
+      isFinal &&  !toDenot(sym).isClassConstructor && !(sym is Flags.Mutable) &&  !(sym.enclosingClass is Flags.Trait)
 
     def getsJavaPrivateFlag: Boolean =
       isPrivate //|| (sym.isPrimaryConstructor && sym.owner.isTopLevelModuleClass)
@@ -449,14 +609,15 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
     def isVarargsMethod: Boolean = sym is Flags.JavaVarargs
     def isDeprecated: Boolean = false
     def isMutable: Boolean = sym is Flags.Mutable
-    def hasAbstractFlag: Boolean = (sym is Flags.Abstract) || (sym is Flags.JavaInterface)
+    def hasAbstractFlag: Boolean =
+      (sym is Flags.Abstract) || (sym is Flags.JavaInterface) || (sym is Flags.Trait)
     def hasModuleFlag: Boolean = sym is Flags.Module
     def isSynchronized: Boolean = sym is Flags.Synchronized
     def isNonBottomSubClass(other: Symbol): Boolean = sym.derivesFrom(other)
     def hasAnnotation(sym: Symbol): Boolean = false
     def shouldEmitForwarders: Boolean =  //exitingPickler { !(sym.name.toString contains '$')
       (sym is Flags.Module) && !(sym is Flags.ImplClass) /// !sym.isNestedClass
-    def isJavaEntryPoint: Boolean = CollectEntryPoints.isJavaEntyPoint(sym)
+    def isJavaEntryPoint: Boolean = CollectEntryPoints.isJavaEntryPoint(sym)
 
     def isClassConstructor: Boolean = toDenot(sym).isClassConstructor
 
@@ -471,38 +632,73 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
 
     // navigation
     def owner: Symbol = toDenot(sym).owner
-    def rawowner: Symbol = owner
+    def rawowner: Symbol = {
+      originalOwner
+    }
     def originalOwner: Symbol = {
       try {
         if (sym.exists) {
           val original = toDenot(sym).initial
           val validity = original.validFor
           val shiftedContext = ctx.withPhase(validity.phaseId)
-          val r = toDenot(sym)(shiftedContext).maybeOwner
-          if(r is Flags.Package) NoSymbol
-          else r
+          val r = toDenot(sym)(shiftedContext).maybeOwner.enclosingClass(shiftedContext)
+          r
         } else NoSymbol
       } catch {
         case e: NotDefinedHere => NoSymbol // todo: do we have a method to tests this?
       }
     }
     def parentSymbols: List[Symbol] = toDenot(sym).info.parents.map(_.typeSymbol)
-    def superClass: Symbol = toDenot(sym).superClass
+    def superClass: Symbol =  {
+      val t = toDenot(sym).asClass.superClass
+      if (t.exists) t
+      else if (sym is Flags.ModuleClass) {
+        // workaround #371
+
+        println(s"Warning: mocking up superclass for $sym")
+        ObjectClass
+      }
+      else t
+    }
     def enclClass: Symbol = toDenot(sym).enclosingClass
     def linkedClassOfClass: Symbol = linkedClass
-    def linkedClass: Symbol = toDenot(sym).linkedClass //exitingPickler(sym.linkedClassOfClass)
+    def linkedClass: Symbol = {
+      toDenot(sym)(ctx).linkedClass(ctx)
+    } //exitingPickler(sym.linkedClassOfClass)
     def companionClass: Symbol = toDenot(sym).companionClass
     def companionModule: Symbol = toDenot(sym).companionModule
     def companionSymbol: Symbol = if (sym is Flags.Module) companionClass else companionModule
     def moduleClass: Symbol = toDenot(sym).moduleClass
-    def enclosingClassSym: Symbol = enclClass //todo is handled specially for JavaDefined symbols in scalac
+    def enclosingClassSym: Symbol = {
+      if (this.isClass) {
+        val ct = ctx.withPhase(ctx.flattenPhase.prev)
+        toDenot(sym)(ct).owner.enclosingClass(ct)
+      }
+      else sym.enclosingClass(ctx.withPhase(ctx.flattenPhase.prev))
+    } //todo is handled specially for JavaDefined symbols in scalac
 
 
 
     // members
     def primaryConstructor: Symbol = toDenot(sym).primaryConstructor
-    def nestedClasses: List[Symbol] = memberClasses //exitingPhase(currentRun.lambdaliftPhase)(sym.memberClasses)
-    def memberClasses: List[Symbol] = toDenot(sym).info.memberClasses.map(_.symbol).toList
+
+    /** For currently compiled classes: All locally defined classes including local classes.
+     *  The empty list for classes that are not currently compiled.
+     */
+    def nestedClasses: List[Symbol] = definedClasses(ctx.flattenPhase)
+
+    /** For currently compiled classes: All classes that are declared as members of this class
+     *  (but not inherited ones). The empty list for classes that are not currently compiled.
+     */
+    def memberClasses: List[Symbol] = definedClasses(ctx.lambdaLiftPhase)
+
+    private def definedClasses(phase: Phase) =
+      if (sym.isDefinedInCurrentRun)
+        ctx.atPhase(phase) { implicit ctx =>
+          toDenot(sym).info.decls.filter(_.isClass).toList
+        }
+      else Nil
+
     def annotations: List[Annotation] = Nil
     def companionModuleMembers: List[Symbol] =  {
       // phase travel to exitingPickler: this makes sure that memberClassesOf only sees member classes,
@@ -510,7 +706,9 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
       if (linkedClass.isTopLevelModuleClass) /*exitingPickler*/ linkedClass.memberClasses
       else Nil
     }
-    def fieldSymbols: List[Symbol] = toDenot(sym).info.memberClasses.map(_.symbol).toList
+    def fieldSymbols: List[Symbol] = {
+      toDenot(sym).info.decls.filter(p => p.isTerm && !p.is(Flags.Method)).toList
+    }
     def methodSymbols: List[Symbol] =
       for (f <- toDenot(sym).info.decls.toList if !f.isMethod && f.isTerm && !f.isModule) yield f
     def serialVUID: Option[Long] = None
@@ -533,7 +731,7 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
      * All interfaces implemented by a class, except for those inherited through the superclass.
      *
      */
-    def superInterfaces: List[Symbol] = decorateSymbol(sym).superInterfaces
+    def superInterfaces: List[Symbol] = decorateSymbol(sym).directlyInheritedTraits
 
     /**
      * True for module classes of package level objects. The backend will generate a mirror class for
@@ -554,6 +752,9 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
 
 
     def addRemoteRemoteExceptionAnnotation: Unit = ()
+
+    def samMethod(): Symbol =
+      toDenot(sym).info.abstractTermMembers.headOption.getOrElse(toDenot(sym).info.member(nme.apply)).symbol
   }
 
 
@@ -599,7 +800,8 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
       def primitiveOrClassToBType(sym: Symbol): BType = {
         assert(sym.isClass, sym)
         assert(sym != ArrayClass || isCompilingArray, sym)
-        primitiveTypeMap.getOrElse(sym, storage.getClassBTypeAndRegisterInnerClass(sym.asInstanceOf[ct.int.Symbol]))
+        primitiveTypeMap.getOrElse(sym.asInstanceOf[ct.bTypes.coreBTypes.bTypes.int.Symbol],
+          storage.getClassBTypeAndRegisterInnerClass(sym.asInstanceOf[ct.int.Symbol])).asInstanceOf[BType]
       }
 
       /**
@@ -608,7 +810,7 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
        */
       def nonClassTypeRefToBType(sym: Symbol): ClassBType = {
         assert(sym.isType && isCompilingArray, sym)
-        ObjectReference
+        ObjectReference.asInstanceOf[ct.bTypes.ClassBType]
       }
 
       tp.widenDealias match {
@@ -617,7 +819,7 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
           t.info match {
 
             case _ =>
-              if(!t.symbol.isClass) nonClassTypeRefToBType(t.symbol)  // See comment on nonClassTypeRefToBType
+              if (!t.symbol.isClass) nonClassTypeRefToBType(t.symbol)  // See comment on nonClassTypeRefToBType
               else primitiveOrClassToBType(t.symbol) // Common reference to a type such as scala.Int or java.lang.String
           }
         case Types.ClassInfo(_, sym, _, _, _)           => primitiveOrClassToBType(sym) // We get here, for example, for genLoadModule, which invokes toTypeKind(moduleClassSymbol.info)
@@ -653,7 +855,7 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
               "If possible, please file a bug on issues.scala-lang.org.")
 
           tp match {
-            case ThisType(ArrayClass)               => ObjectReference // was introduced in 9b17332f11 to fix SI-999, but this code is not reached in its test, or any other test
+            case ThisType(ArrayClass)               => ObjectReference.asInstanceOf[ct.bTypes.ClassBType] // was introduced in 9b17332f11 to fix SI-999, but this code is not reached in its test, or any other test
             case ThisType(sym)                      => storage.getClassBTypeAndRegisterInnerClass(sym.asInstanceOf[ct.int.Symbol])
            // case t: SingletonType                 => primitiveOrClassToBType(t.classSymbol)
             case t: SingletonType                  => t.underlying.toTypeKind(ct)(storage)
@@ -664,7 +866,12 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
 
     def summaryString: String = tp.showSummary
 
-    def params: List[Symbol] = Nil // used only for emmiting annotations
+    def params: List[Symbol] =
+      Nil // backend uses this to emmit annotations on parameter lists of forwarders
+          // to static methods of companion class
+          // in Dotty this link does not exists: there is no way to get from method type
+          // to inner symbols of DefDef
+          // todo: somehow handle.
 
     def parents: List[Type] = tp.parents
   }
@@ -677,8 +884,29 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
   }
 
   object Select extends SelectDeconstructor {
-    def _1: Tree = field.qualifier
-    def _2: Name = field.name
+
+    var desugared: tpd.Select = null
+
+    override def isEmpty: Boolean =
+      desugared eq null
+
+    def _1: Tree =  desugared.qualifier
+
+    def _2: Name = desugared.name
+
+    override def unapply(s: Select): this.type = {
+      s match {
+        case t: tpd.Select => desugared = t
+        case t: Ident  =>
+          desugarIdent(t) match {
+            case Some(t) => desugared = t
+            case None => desugared = null
+          }
+        case _ => desugared = null
+      }
+
+      this
+    }
   }
 
   object Apply extends ApplyDeconstructor {
@@ -710,7 +938,16 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
   }
 
   object Throw extends ThrowDeconstructor {
-    def get = field.expr
+    def get = field.args.head
+
+    override def unapply(s: Throw): DottyBackendInterface.this.Throw.type = {
+      if (s.fun.symbol eq defn.throwMethod) {
+        field = s
+      } else {
+        field = null
+      }
+      this
+    }
   }
 
   object New extends NewDeconstructor {
@@ -753,7 +990,7 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
     def _3: Tree = field.rhs
 
     override def unapply(s: LabelDef): DottyBackendInterface.this.LabelDef.type = {
-      if(s.symbol is Flags.Label) this.field = s
+      if (s.symbol is Flags.Label) this.field = s
       else this.field = null
       this
     }
@@ -832,13 +1069,13 @@ class DottyBackendInterface()(implicit ctx: Context) extends BackendInterface{
     def _2 = field.meth
     def _3 = {
       val t = field.tpt.tpe.typeSymbol
-      if(t.exists) t
+      if (t.exists) t
       else {
         val arity = field.meth.tpe.widenDealias.paramTypes.size - _1.size
         val returnsUnit = field.meth.tpe.widenDealias.resultType.classSymbol == UnitClass
-        if(returnsUnit)
-          ctx.requiredClass(("scala.compat.java8.JProcedure"+arity).toTermName)
-        else ctx.requiredClass(("scala.compat.java8.JFunction"+arity).toTermName)
+        if (returnsUnit)
+          ctx.requiredClass(("scala.compat.java8.JProcedure" + arity).toTermName)
+        else ctx.requiredClass(("scala.compat.java8.JFunction" + arity).toTermName)
       }
     }
   }
